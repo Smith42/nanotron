@@ -158,17 +158,14 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
         device=None,
         seq_len_interpolation_factor=None,
     ):
-        # astropt3: flash-attn >= 2.8 dropped the pos_idx_in_fp32 __init__ arg;
-        # keep the attribute for our _update_cos_sin_cache override and pass
-        # the rest by keyword.
         super().__init__(
             dim,
-            base=base,
-            interleaved=interleaved,
-            scale_base=scale_base,
-            device=device,
+            base,
+            interleaved,
+            scale_base,
+            pos_idx_in_fp32,
+            device,
         )
-        self.pos_idx_in_fp32 = pos_idx_in_fp32
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
