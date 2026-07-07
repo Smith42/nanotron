@@ -28,6 +28,7 @@ from nanotron.logging import get_logger, human_format
 from nanotron.parallel.pipeline_parallel.engine import PipelineEngine
 from nanotron.parallel.tensor_parallel.nn import TensorParallelLinearMode
 from nanotron.config.models_config import Qwen2Config
+from nanotron.config.astropt3_config import AstroPT3Config, AstroPT3StreamingDatasetsArgs
 
 logger = get_logger(__name__)
 
@@ -210,7 +211,7 @@ class DataArgs:
     """Arguments related to the data and data files processing"""
 
     dataset: Optional[
-        Union[PretrainDatasetsArgs, NanosetDatasetsArgs, SFTDatasetsArgs]
+        Union[PretrainDatasetsArgs, NanosetDatasetsArgs, SFTDatasetsArgs, AstroPT3StreamingDatasetsArgs]
     ]  # If None we use dummy_infinite_data_generator
     seed: Optional[int]
     num_loading_workers: Optional[int] = 1
@@ -319,7 +320,10 @@ class ModelArgs:
             self.dtype = cast_str_to_torch_dtype(self.dtype)
 
         if isinstance(self.model_config, dict):
-            self.model_config = Qwen2Config(**self.model_config)
+            if self.model_config.get("is_astropt3_config", False):
+                self.model_config = AstroPT3Config(**self.model_config)
+            else:
+                self.model_config = Qwen2Config(**self.model_config)
 
         self.model_config._is_using_mup = isinstance(self.init_method, SpectralMupInit)
 

@@ -207,6 +207,8 @@ def get_custom_weight_decay_for_named_parameters(
     counter_excluded_params = 0
     for name, param in named_parameters:
         # Handle tied parameters: we exclude all tied parameters if one of them is in the exclude list
+        # astropt3: default tied_name to name — upstream left it unbound for non-tied params
+        tied_name = name
         if param.is_tied:
             tied_name = param.get_tied_info().get_full_name_from_module_id_to_prefix(
                 module_id_to_prefix=module_id_to_prefix

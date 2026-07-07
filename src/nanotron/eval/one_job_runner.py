@@ -68,9 +68,7 @@ class LightEvalRunner:
                 current_step=self.config.general.step,
             )
         else:
-            logger.warning(
-                f"Skipping evaluation at step {self.config.general.step} because it's not a multiple of {self.lighteval_config.eval_interval}"
-            )
+            logger.warning(f"Skipping evaluation at step {self.config.general.step} because it's not a multiple of {self.lighteval_config.eval_interval}")
             return None, None
 
         return slurm_job_id, slurm_log

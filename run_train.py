@@ -15,6 +15,7 @@ from typing import Dict, Optional, cast
 import nanotron.distributed as dist
 from nanotron import logging
 from nanotron.config import (
+    AstroPT3StreamingDatasetsArgs,
     DataArgs,
     DatasetStageArgs,
     NanosetDatasetsArgs,
@@ -295,6 +296,22 @@ def get_dataloader_from_data_stage(
         #     dataloader_pin_memory=True,
         # )
         # dist.barrier()
+
+    # Case 4: AstroPT3 packed multimodal streaming (parquet shards or synthetic)
+    elif isinstance(data.dataset, AstroPT3StreamingDatasetsArgs):
+        log_rank("Using astropt3_streaming dataloader", logger=logger, level=logging.INFO, rank=0)
+        from astropt3.data.nanotron_loader import build_astropt3_dataloader
+
+        dataloader = build_astropt3_dataloader(
+            dataset_args=data.dataset,
+            model_config=trainer.model_config,
+            micro_batch_size=trainer.micro_batch_size,
+            sequence_length=trainer.sequence_length,
+            dp_rank=dist.get_rank(trainer.parallel_context.dp_pg),
+            dp_size=trainer.parallel_context.dp_pg.size(),
+            num_workers=data.num_loading_workers,
+            seed=data.seed,
+        )
 
     else:
         raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}")
