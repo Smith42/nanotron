@@ -63,6 +63,7 @@ from nanotron.logging.timers import nanotron_timer
 from nanotron.metrics_logging import MetricsLogger
 from nanotron.models import NanotronModel, build_model
 from nanotron.models.base import check_model_has_grad
+from nanotron.models.astropt3 import AstroPT3ForTraining
 from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.qwen import Qwen2ForTraining
 from nanotron.models.starcoder2 import Starcoder2ForTraining
@@ -113,6 +114,7 @@ CONFIG_TO_MODEL_CLASS = {
     "LlamaConfig": LlamaForTraining,
     "Starcoder2Config": Starcoder2ForTraining,
     "Qwen2Config": Qwen2ForTraining,
+    "AstroPT3Config": AstroPT3ForTraining,
 }
 
 try:
@@ -570,7 +572,10 @@ class DistributedTrainer:
 
                 # Training Logs
                 # Track consumed tokens for all dataset folders in current stage
-                if hasattr(self.current_base_dl, "dataset"):
+                # astropt3: only BlendableDataset exposes consumption stats
+                if hasattr(self.current_base_dl, "dataset") and hasattr(
+                    self.current_base_dl.dataset, "get_consumption_stats"
+                ):
                     consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
                     current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
@@ -880,7 +885,10 @@ class DistributedTrainer:
             assert self.current_base_dl is not None, "current_base_dl should be defined"
 
             # Log consumption statistics
-            if hasattr(self.current_base_dl, "dataset"):
+            # astropt3: only BlendableDataset exposes consumption stats
+            if hasattr(self.current_base_dl, "dataset") and hasattr(
+                self.current_base_dl.dataset, "get_consumption_stats"
+            ):
                 for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
                     basic_log_entries.extend(
                         [
