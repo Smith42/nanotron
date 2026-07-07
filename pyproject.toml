@@ -16,12 +16,13 @@ classifiers = [
 dependencies = [
     "torch>=1.13.1",
     "pyyaml",
-    "numpy<2",
+    "numpy",  # astropt3: relaxed from <2; the astropt3 data pipeline runs on numpy 2
     "packaging",
     "safetensors",
     "dacite",
     "tqdm",
     "datasets",
+    "psutil",  # astropt3: used by trainer.py but was missing from upstream deps
 ]
 
 [tool.setuptools.packages.find]
