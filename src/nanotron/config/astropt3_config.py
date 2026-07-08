@@ -109,3 +109,6 @@ class AstroPT3StreamingDatasetsArgs:
     shuffle_buffer_size: int = 0
     # synthetic stream controls (data_root == "synthetic")
     synthetic_image_only_fraction: float = 0.3
+    # append one object_id line per trained object to {path}.dp{rank} —
+    # the no-replay audit trail for kill/resume verification
+    object_id_log: Optional[str] = None

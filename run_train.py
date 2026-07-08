@@ -300,7 +300,22 @@ def get_dataloader_from_data_stage(
     # Case 4: AstroPT3 packed multimodal streaming (parquet shards or synthetic)
     elif isinstance(data.dataset, AstroPT3StreamingDatasetsArgs):
         log_rank("Using astropt3_streaming dataloader", logger=logger, level=logging.INFO, rank=0)
+        from pathlib import Path
+
         from astropt3.data.nanotron_loader import build_astropt3_dataloader
+
+        # resume the stream from the checkpoint's saved dataset state, if any
+        resume_state_dir = None
+        if trainer.init_checkpoint_path is not None:
+            candidate = Path(trainer.init_checkpoint_path) / "dataset_state"
+            if candidate.exists():
+                resume_state_dir = candidate
+                log_rank(
+                    f"Resuming astropt3 stream state from {candidate}",
+                    logger=logger,
+                    level=logging.INFO,
+                    rank=0,
+                )
 
         dataloader = build_astropt3_dataloader(
             dataset_args=data.dataset,
@@ -311,6 +326,7 @@ def get_dataloader_from_data_stage(
             dp_size=trainer.parallel_context.dp_pg.size(),
             num_workers=data.num_loading_workers,
             seed=data.seed,
+            resume_state_dir=resume_state_dir,
         )
 
     else:
