@@ -458,9 +458,12 @@ def init_optimizer_and_grad_accumulator(
                     for name, param in unwrapped_model.named_parameters()
                 },
             ),
-            hook=get_fp32_accum_hook(
-                reduce_scatter=optimizer.inherit_from(ZeroDistributedOptimizer), reduce_op=dist.ReduceOp.AVG
-            ),
+            # astropt3: the reduce-scatter branch of fp32_accum_hook is an
+            # unfinished upstream optimization (raises NotImplementedError),
+            # which broke DDP + fp32-accum + ZeRO-1 outright. All-reduce the
+            # fp32 grads instead — same convention as the non-DDP path in
+            # trainer.py, which also passes reduce_scatter=False.
+            hook=get_fp32_accum_hook(reduce_scatter=False, reduce_op=dist.ReduceOp.AVG),
         )
 
     return optimizer, grad_accumulator
