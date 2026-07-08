@@ -251,12 +251,18 @@ class CheckpointsArgs:
     load_lr_scheduler: Optional[bool] = True
     load_optimizer: Optional[bool] = True
     checkpoints_path_is_shared_file_system: Optional[bool] = False
+    # "pythia": save at steps 1,2,4,...,512 AND every checkpoint_interval
+    # steps (schedule implemented in the astropt3 package). None: interval only.
+    checkpoint_schedule: Optional[str] = None
 
     def __post_init__(self):
         if isinstance(self.checkpoints_path, str):
             self.checkpoints_path = xPath(self.checkpoints_path)
         if isinstance(self.resume_checkpoint_path, str):
             self.resume_checkpoint_path = xPath(self.resume_checkpoint_path)
+        assert self.checkpoint_schedule in (None, "pythia"), (
+            f"unknown checkpoint_schedule {self.checkpoint_schedule!r}"
+        )
 
 
 @dataclass

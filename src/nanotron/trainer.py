@@ -590,13 +590,24 @@ class DistributedTrainer:
                 self.metadata.consumed_tokens_total += self.global_batch_size * self.sequence_length
                 self.metadata.last_train_step = self.iteration_step
                 self.metadata.current_stage.consumed_train_samples += self.global_batch_size
+
+                # astropt3: the streaming dataset exposes no per-folder
+                # consumption stats, so keep the stage's token ledger in sync
+                # by hand or TrainingMetadata's consumed_tokens_total
+                # invariant fails when the checkpoint is loaded on resume
+                _ds = getattr(getattr(self, "current_base_dl", None), "dataset", None)
+                if _ds is not None and hasattr(_ds, "_ckpt_state"):
+                    self.metadata.current_stage.consumed_tokens_per_dataset_folder = {
+                        getattr(_ds, "data_root", "stream"): self.metadata.current_stage.consumed_train_samples
+                        * self.sequence_length
+                    }
                 assert self.metadata.current_stage.sequence_length == self.sequence_length, "Sequence length mismatch between the current stage and the global sequence length"
 
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg, z_loss_avg=z_loss_avg, tbi_logs=tbi_logs)
 
                 # Checkpoint
-                if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
+                if self._should_checkpoint():
                     self.save_checkpoint()
 
         dist.barrier()  # let's wait for everyone before leaving
@@ -1249,6 +1260,15 @@ class DistributedTrainer:
                     checkpoint_path = Path(self.config.checkpoints.checkpoints_path) / f"{self.config.general.step}"
                     self.lighteval_runner.eval_single_checkpoint(checkpoint_path)
 
+    def _should_checkpoint(self) -> bool:
+        interval = self.config.checkpoints.checkpoint_interval
+        if getattr(self.config.checkpoints, "checkpoint_schedule", None) == "pythia":
+            # canonical schedule lives in the astropt3 package (CPU-testable)
+            from astropt3.checkpoint_schedule import should_checkpoint
+
+            return should_checkpoint(self.iteration_step, interval)
+        return self.iteration_step % interval == 0
+
     def save_checkpoint(self) -> Path:
         self.pre_save_checkpoint()
 
@@ -1289,6 +1309,27 @@ class DistributedTrainer:
         save_random_states(
             random_states=self.random_states, parallel_context=self.parallel_context, root_folder=checkpoint_path
         )
+        # astropt3: persist the streaming-dataset position so a resumed run
+        # continues the stream instead of restarting it. `_ckpt_state` marks
+        # the astropt3 PackedMicroBatches dataset; state_dict() returns None
+        # when the stream is not stateful (num_loading_workers > 0). One file
+        # per DP rank — streams are identical within a TP/CP group, so only
+        # their rank-0 writes. Written before latest.txt so a visible
+        # checkpoint always has complete stream state.
+        dataset = getattr(getattr(self, "current_base_dl", None), "dataset", None)
+        if dataset is not None and hasattr(dataset, "_ckpt_state") and hasattr(dataset, "state_dict"):
+            dataset_state = dataset.state_dict()
+            if dataset_state is not None and (
+                dist.get_rank(self.parallel_context.tp_pg) == 0
+                and dist.get_rank(self.parallel_context.pp_pg) == 0
+                and dist.get_rank(self.parallel_context.cp_pg) == 0
+            ):
+                state_dir = checkpoint_path / "dataset_state"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    dataset_state,
+                    state_dir / f"dp_{dist.get_rank(self.parallel_context.dp_pg)}.pt",
+                )
         with open(checkpoints_path / "latest.txt", mode="w") as fo:
             fo.write(f"{self.iteration_step}")
 
