@@ -800,6 +800,16 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
+        # astropt3: surface per-modality losses (rank-local like z_loss —
+        # not DP-synced, logging only). The model emits {name}_loss for every
+        # modality on every micro-batch (0.0 when absent from the batch).
+        if outputs and isinstance(outputs[0], dict):
+            for key in sorted(outputs[0]):
+                if key.endswith("_loss") and key not in ("z_loss",) and isinstance(
+                    outputs[0][key], torch.Tensor
+                ):
+                    value = torch.stack([o[key] for o in outputs]).mean().item()
+                    basic_log_entries.append(LogItem(key, value, "human_format"))
 
         def get_cpu_logitems():
             # Add CPU memory usage metrics
