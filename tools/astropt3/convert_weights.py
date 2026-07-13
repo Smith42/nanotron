@@ -13,6 +13,7 @@ Weight-name contract (modeled on examples/smollm3):
   encoders.{m}.*         model.token_position_embeddings.pp_block.encoders.{m}.*
   pos_embeds.{m}.*       model.token_position_embeddings.pp_block.pos_embeds.{m}.*
   decoders.{m}.*         model.modality_head.pp_block.decoders.{m}.*
+  flows.{m}.*            model.token_position_embeddings.pp_block.flows.{m}.*  (jetformer)
   model.norm.weight      model.final_layer_norm.pp_block.weight
   =====================  =====================================================
 
@@ -64,15 +65,32 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
         hf_to_nt_map[f"{hf_prefix}.input_layernorm.weight"] = f"{nt_prefix}.input_layernorm.weight"
         hf_to_nt_map[f"{hf_prefix}.post_attention_layernorm.weight"] = f"{nt_prefix}.post_attention_layernorm.weight"
 
-    # modality modules: generate from the tokeniser structure so affine and
-    # aim both map (weights only; both implementations use bias=False)
-    weight_names = ["c_fc.weight"] if config.tokeniser == "affine" else ["c_fc.weight", "c_proj.weight"]
+    # modality modules: generate from the tokeniser structure so affine, aim
+    # and jetformer all map (weights only; all implementations use bias=False)
+    if config.tokeniser == "jetformer":
+        encoder_weights, decoder_weights = ["c_fc.weight"], ["proj.weight"]
+    elif config.tokeniser == "affine":
+        encoder_weights = decoder_weights = ["c_fc.weight"]
+    else:  # aim
+        encoder_weights = decoder_weights = ["c_fc.weight", "c_proj.weight"]
     for mod in config.modalities:
         name = mod["name"]
-        for w in weight_names:
+        for w in encoder_weights:
             hf_to_nt_map[f"encoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.{w}"
+        for w in decoder_weights:
             hf_to_nt_map[f"decoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.{w}"
         hf_to_nt_map[f"pos_embeds.{name}.embed.weight"] = f"{_MODALITY_PREFIX_MAP['pos_embeds.']}{name}.embed.weight"
+        if config.tokeniser == "jetformer":
+            # HF flows.{m}.blocks.{i}.net.{0,2}.{weight,bias} <-> fork
+            # ...token_position_embeddings.pp_block.flows.{m}... (CouplingMLP
+            # nets carry biases, unlike the affine modality layers)
+            for i in range(config.jetformer_flow_steps):
+                for layer in (0, 2):
+                    for p in ("weight", "bias"):
+                        hf_key = f"flows.{name}.blocks.{i}.net.{layer}.{p}"
+                        hf_to_nt_map[hf_key] = (
+                            f"model.token_position_embeddings.pp_block.flows.{name}.blocks.{i}.net.{layer}.{p}"
+                        )
 
     if nt_to_hf:
         nt_to_hf_map = {}
@@ -103,6 +121,11 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "huber_delta": "huber_delta",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
+        "jetformer_flow_steps": "jetformer_flow_steps",
+        "jetformer_flow_hidden": "jetformer_flow_hidden",
+        "jetformer_gmm_k": "jetformer_gmm_k",
+        "jetformer_noise_max": "jetformer_noise_max",
+        "jetformer_noise_min": "jetformer_noise_min",
         "max_position_embeddings": "max_position_embeddings",
         "modalities": "modalities",
         "no_rope_layer_interval": "no_rope_layer",

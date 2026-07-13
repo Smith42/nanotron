@@ -560,6 +560,10 @@ class DistributedTrainer:
                 self.iteration_timer.start()
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
+                # astropt3 jetformer: anneal the flow-noise curriculum over the run
+                if hasattr(self.unwrapped_model, "set_jet_noise_frac"):
+                    self.unwrapped_model.set_jet_noise_frac(self.iteration_step / self.config.tokens.train_steps)
+
                 # Training step
                 outputs, loss_avg, z_loss_avg, tbi_logs = self.training_step(dataloader=self.current_dataloader)
 
