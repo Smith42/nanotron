@@ -67,6 +67,10 @@ class AstroPT3Config(Qwen2Config):
     jetformer_gmm_k: int = 4
     jetformer_noise_max: float = 0.1
     jetformer_noise_min: float = 0.0
+    # arcsinh divisor (nMgy) of the physical image normalization; threaded
+    # into the sequencer by astro's build_astropt3_dataloader and carried
+    # into converted HF checkpoints (mirrors the HF-side default)
+    image_norm_divisor: float = 0.01
 
     def __post_init__(self):
         # Qwen2Config asserts num_hidden_layers % no_rope_layer == 0, but the

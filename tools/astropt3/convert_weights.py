@@ -119,6 +119,7 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "hidden_act": "hidden_act",
         "hidden_size": "hidden_size",
         "huber_delta": "huber_delta",
+        "image_norm_divisor": "image_norm_divisor",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
         "jetformer_flow_steps": "jetformer_flow_steps",
