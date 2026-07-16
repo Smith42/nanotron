@@ -21,6 +21,7 @@ dependencies = [
     "safetensors",
     "dacite",
     "tqdm",
+    "wandb",
     "datasets",
     "psutil",  # astropt3: used by trainer.py but was missing from upstream deps
     "torchtyping"

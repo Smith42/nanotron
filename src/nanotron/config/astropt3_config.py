@@ -54,10 +54,19 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    tokeniser: str = "affine"  # "affine" (default) or "aim" (astroPT MLP)
+    tokeniser: str = "affine"  # "affine" (default), "aim" (astroPT MLP) or "jetformer" (flow + GMM)
     huber_delta: float = 1.0
     vocab_size: int = 64
     tie_word_embeddings: bool = False
+    # jetformer tokeniser (mirrors the HF-side AstroPT3Config defaults):
+    # per-modality TinyFlow1D + GMMHead, loss = mean(NLL_GMM(z) - logdet).
+    # noise_max -> noise_min is the flow-stability curriculum, annealed by the
+    # trainer via set_jet_noise_frac(iteration / train_steps).
+    jetformer_flow_steps: int = 4
+    jetformer_flow_hidden: int = 128
+    jetformer_gmm_k: int = 4
+    jetformer_noise_max: float = 0.1
+    jetformer_noise_min: float = 0.0
 
     def __post_init__(self):
         # Qwen2Config asserts num_hidden_layers % no_rope_layer == 0, but the
@@ -71,7 +80,7 @@ class AstroPT3Config(Qwen2Config):
         if self.modalities is None:
             self.modalities = [dict(m) for m in DEFAULT_MODALITIES]
         assert not self.tie_word_embeddings, "astropt3 has no lm_head to tie"
-        assert self.tokeniser in ("affine", "aim"), f"unknown tokeniser {self.tokeniser!r}"
+        assert self.tokeniser in ("affine", "aim", "jetformer"), f"unknown tokeniser {self.tokeniser!r}"
         names = [m["name"] for m in self.modalities]
         assert len(set(names)) == len(names), f"duplicate modality names: {names}"
 

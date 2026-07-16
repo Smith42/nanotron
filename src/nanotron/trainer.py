@@ -560,6 +560,10 @@ class DistributedTrainer:
                 self.iteration_timer.start()
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
+                # astropt3 jetformer: anneal the flow-noise curriculum over the run
+                if hasattr(self.unwrapped_model, "set_jet_noise_frac"):
+                    self.unwrapped_model.set_jet_noise_frac(self.iteration_step / self.config.tokens.train_steps)
+
                 # Training step
                 outputs, loss_avg, z_loss_avg, tbi_logs = self.training_step(dataloader=self.current_dataloader)
 
@@ -800,6 +804,16 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
+        # astropt3: surface per-modality losses (rank-local like z_loss —
+        # not DP-synced, logging only). The model emits {name}_loss for every
+        # modality on every micro-batch (0.0 when absent from the batch).
+        if outputs and isinstance(outputs[0], dict):
+            for key in sorted(outputs[0]):
+                if key.endswith("_loss") and key not in ("z_loss",) and isinstance(
+                    outputs[0][key], torch.Tensor
+                ):
+                    value = torch.stack([o[key] for o in outputs]).mean().item()
+                    basic_log_entries.append(LogItem(key, value, "human_format"))
 
         def get_cpu_logitems():
             # Add CPU memory usage metrics
@@ -1311,14 +1325,18 @@ class DistributedTrainer:
         )
         # astropt3: persist the streaming-dataset position so a resumed run
         # continues the stream instead of restarting it. `_ckpt_state` marks
-        # the astropt3 PackedMicroBatches dataset; state_dict() returns None
-        # when the stream is not stateful (num_loading_workers > 0). One file
-        # per DP rank — streams are identical within a TP/CP group, so only
-        # their rank-0 writes. Written before latest.txt so a visible
+        # the astropt3 PackedMicroBatches dataset; loader_state_dict captures
+        # a torchdata StatefulDataLoader's per-worker states when
+        # num_loading_workers > 0, or the dataset's own state at workers == 0.
+        # One file per DP rank — streams are identical within a TP/CP group,
+        # so only their rank-0 writes. Written before latest.txt so a visible
         # checkpoint always has complete stream state.
-        dataset = getattr(getattr(self, "current_base_dl", None), "dataset", None)
+        base_dl = getattr(self, "current_base_dl", None)
+        dataset = getattr(base_dl, "dataset", None)
         if dataset is not None and hasattr(dataset, "_ckpt_state") and hasattr(dataset, "state_dict"):
-            dataset_state = dataset.state_dict()
+            from astropt3.data.nanotron_loader import loader_state_dict
+
+            dataset_state = loader_state_dict(base_dl)
             if dataset_state is not None and (
                 dist.get_rank(self.parallel_context.tp_pg) == 0
                 and dist.get_rank(self.parallel_context.pp_pg) == 0
