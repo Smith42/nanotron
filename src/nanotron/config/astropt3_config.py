@@ -126,8 +126,12 @@ class AstroPT3StreamingDatasetsArgs:
     is_astropt3_streaming: bool = True
     norm_stats: Optional[str] = None
     shuffle_buffer_size: int = 0
+    # ADR 0005: list each spectrum-only shard ({data_root}/spectra/*.parquet)
+    # this many times per epoch — the shard-level oversampling knob
+    spectra_oversample: int = 1
     # synthetic stream controls (data_root == "synthetic")
     synthetic_image_only_fraction: float = 0.3
+    synthetic_spectrum_only_fraction: float = 0.0
     # append one object_id line per trained object to {path}.dp{rank} —
     # the no-replay audit trail for kill/resume verification
     object_id_log: Optional[str] = None
