@@ -71,6 +71,12 @@ class AstroPT3Config(Qwen2Config):
     # into the sequencer by astro's build_astropt3_dataloader and carried
     # into converted HF checkpoints (mirrors the HF-side default)
     image_norm_divisor: float = 0.01
+    # center-outward spiral image patch order (ADR 0004); threaded into the
+    # sequencer like image_norm_divisor and carried into converted HF
+    # checkpoints. Default True matching the HF-side AstroPT3Config (the
+    # agreed going-forward default); raster checkpoints must set
+    # spiral: false explicitly.
+    spiral: bool = True
 
     def __post_init__(self):
         # Qwen2Config asserts num_hidden_layers % no_rope_layer == 0, but the
