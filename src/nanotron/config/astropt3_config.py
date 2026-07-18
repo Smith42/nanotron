@@ -71,6 +71,10 @@ class AstroPT3Config(Qwen2Config):
     # into the sequencer by astro's build_astropt3_dataloader and carried
     # into converted HF checkpoints (mirrors the HF-side default)
     image_norm_divisor: float = 0.01
+    # arcsinh knee (nMgy) of the physical spectra normalization (ADR 0007),
+    # the spectra counterpart of image_norm_divisor; threaded and converted
+    # the same way (mirrors the HF-side default)
+    spectra_norm_divisor: float = 10.0
     # center-outward spiral image patch order (ADR 0004); threaded into the
     # sequencer like image_norm_divisor and carried into converted HF
     # checkpoints. Default True matching the HF-side AstroPT3Config (the

@@ -136,6 +136,7 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "pad_token_id": "pad_token_id",
         "rms_norm_eps": "rms_norm_eps",
         "rope_theta": "rope_theta",
+        "spectra_norm_divisor": "spectra_norm_divisor",
         "spiral": "spiral",
         "tie_word_embeddings": "tie_word_embeddings",
         "tokeniser": "tokeniser",
