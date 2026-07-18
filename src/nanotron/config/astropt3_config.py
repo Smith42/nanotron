@@ -75,6 +75,11 @@ class AstroPT3Config(Qwen2Config):
     # the spectra counterpart of image_norm_divisor; threaded and converted
     # the same way (mirrors the HF-side default)
     spectra_norm_divisor: float = 10.0
+    # ADR 0005 amendment: randomized 50/50 bimodal modality-span order
+    # (teaches both conditioning directions); threaded into the sequencer
+    # and carried into converted HF checkpoints. Default False — legacy
+    # fixed-order checkpoints must stay self-describing.
+    shuffle_modality_order: bool = False
     # center-outward spiral image patch order (ADR 0004); threaded into the
     # sequencer like image_norm_divisor and carried into converted HF
     # checkpoints. Default True matching the HF-side AstroPT3Config (the
