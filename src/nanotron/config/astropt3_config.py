@@ -20,7 +20,8 @@ from typing import List, Optional
 from nanotron.config.models_config import Qwen2Config
 
 # Pinned to the verified MMU pilot schemas (images (3,152,152) patch 8;
-# DESI spectra 7781 bins patch 256). Must stay in sync with the HF-side
+# DESI spectra 7781 bins patch 256; ADR 0008 one-token scalar spans with
+# GMM heads under both tokenisers). Must stay in sync with the HF-side
 # DEFAULT_MODALITIES in astropt3/configuration_astropt3.py.
 DEFAULT_MODALITIES = [
     {
@@ -40,6 +41,36 @@ DEFAULT_MODALITIES = [
         "pos_input_size": 1,
         "max_positions": 1024,
         "loss_weight": 1.0,
+    },
+    {
+        "name": "Z",
+        "input_size": 1,
+        "patch_size": 1,
+        "pos_type": "index",
+        "pos_input_size": 1,
+        "max_positions": 1,
+        "loss_weight": 0.1,
+        "scalar": True,
+    },
+    {
+        "name": "ebv",
+        "input_size": 1,
+        "patch_size": 1,
+        "pos_type": "index",
+        "pos_input_size": 1,
+        "max_positions": 1,
+        "loss_weight": 0.1,
+        "scalar": True,
+    },
+    {
+        "name": "photometry",
+        "input_size": 3,
+        "patch_size": 1,
+        "pos_type": "index",
+        "pos_input_size": 1,
+        "max_positions": 1,
+        "loss_weight": 0.1,
+        "scalar": True,
     },
 ]
 
@@ -67,6 +98,9 @@ class AstroPT3Config(Qwen2Config):
     jetformer_gmm_k: int = 4
     jetformer_noise_max: float = 0.1
     jetformer_noise_min: float = 0.0
+    # ADR 0008 scalar modalities: mixture count of the scalar GMM heads
+    # (used under BOTH tokenisers; carried into converted HF checkpoints)
+    scalar_gmm_k: int = 5
     # arcsinh divisor (nMgy) of the physical image normalization; threaded
     # into the sequencer by astro's build_astropt3_dataloader and carried
     # into converted HF checkpoints (mirrors the HF-side default)

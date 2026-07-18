@@ -75,12 +75,14 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
         encoder_weights = decoder_weights = ["c_fc.weight", "c_proj.weight"]
     for mod in config.modalities:
         name = mod["name"]
+        # ADR 0008 scalars: GMMHead (proj.weight) under every tokeniser, no flow
+        scalar = mod.get("scalar", False)
         for w in encoder_weights:
             hf_to_nt_map[f"encoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.{w}"
-        for w in decoder_weights:
+        for w in ["proj.weight"] if scalar else decoder_weights:
             hf_to_nt_map[f"decoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.{w}"
         hf_to_nt_map[f"pos_embeds.{name}.embed.weight"] = f"{_MODALITY_PREFIX_MAP['pos_embeds.']}{name}.embed.weight"
-        if config.tokeniser == "jetformer":
+        if config.tokeniser == "jetformer" and not scalar:
             # HF flows.{m}.blocks.{i}.net.{0,2}.{weight,bias} <-> fork
             # ...token_position_embeddings.pp_block.flows.{m}... (CouplingMLP
             # nets carry biases, unlike the affine modality layers)
@@ -136,6 +138,7 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "pad_token_id": "pad_token_id",
         "rms_norm_eps": "rms_norm_eps",
         "rope_theta": "rope_theta",
+        "scalar_gmm_k": "scalar_gmm_k",
         "spectra_norm_divisor": "spectra_norm_divisor",
         "spiral": "spiral",
         "tie_word_embeddings": "tie_word_embeddings",

@@ -280,6 +280,11 @@ class AstroPT3Embedding(nn.Module):
             {name: PositionEmbedder(config.hidden_size, config.modality(name)) for name in config.modality_names()}
         )
         self.tokeniser = config.tokeniser
+        # ADR 0008: scalar modalities never flow — raw normalized value is
+        # both the embedded input and the GMM target (mirrors the HF side)
+        self.scalar_names = {
+            name for name in config.modality_names() if config.modality(name).get("scalar", False)
+        }
         if config.tokeniser == "jetformer":
             self.flows = nn.ModuleDict(
                 {
@@ -289,6 +294,7 @@ class AstroPT3Embedding(nn.Module):
                         hidden_dim=config.jetformer_flow_hidden,
                     )
                     for name in config.modality_names()
+                    if name not in self.scalar_names
                 }
             )
             # Noise curriculum (HF twin: AstroPT3Model.set_jet_noise_frac):
@@ -319,7 +325,7 @@ class AstroPT3Embedding(nn.Module):
         # gradient, so DDP never sees unused parameters.
         for name, encoder in self.encoders.items():
             values = modality_values[name].to(input_embeds.dtype)
-            if self.tokeniser == "jetformer":
+            if self.tokeniser == "jetformer" and name not in self.scalar_names:
                 z, logdet = self.flows[name](values)
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
@@ -344,26 +350,21 @@ class AstroPT3ModalityHead(nn.Module):
 
     def __init__(self, config: AstroPT3Config):
         super().__init__()
-        if config.tokeniser == "jetformer":
-            # GMM heads under the same name/key ({m}_pred stays one tensor,
-            # the raw K*(1+2D) projection unpacked inside the loss)
-            self.decoders = nn.ModuleDict(
-                {
-                    name: GMMHead(
-                        config.hidden_size,
-                        config.modality(name)["input_size"],
-                        config.jetformer_gmm_k,
-                    )
-                    for name in config.modality_names()
-                }
-            )
-        else:
-            self.decoders = nn.ModuleDict(
-                {
-                    name: Decoder(config.hidden_size, config.modality(name)["input_size"], config.tokeniser)
-                    for name in config.modality_names()
-                }
-            )
+        scalar_names = {
+            name for name in config.modality_names() if config.modality(name).get("scalar", False)
+        }
+
+        def build_head(name):
+            # ADR 0008: scalar modalities are GMM-headed under BOTH
+            # tokenisers ({m}_pred stays one tensor, the raw K*(1+2D)
+            # projection unpacked inside the loss)
+            if name in scalar_names:
+                return GMMHead(config.hidden_size, config.modality(name)["input_size"], config.scalar_gmm_k)
+            if config.tokeniser == "jetformer":
+                return GMMHead(config.hidden_size, config.modality(name)["input_size"], config.jetformer_gmm_k)
+            return Decoder(config.hidden_size, config.modality(name)["input_size"], config.tokeniser)
+
+        self.decoders = nn.ModuleDict({name: build_head(name) for name in config.modality_names()})
 
     def forward(
         self,
@@ -395,6 +396,10 @@ class AstroPT3Loss(nn.Module):
         self.tokeniser = config.tokeniser
         self.huber_delta = config.huber_delta
         self.gmm_k = config.jetformer_gmm_k
+        self.scalar_gmm_k = config.scalar_gmm_k
+        self.scalar_names = {
+            name for name in config.modality_names() if config.modality(name).get("scalar", False)
+        }
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.loss_weights = {name: config.modality(name).get("loss_weight", 1.0) for name in config.modality_names()}
 
@@ -410,6 +415,14 @@ class AstroPT3Loss(nn.Module):
             pred = predictions[f"{name}_pred"]
             if pred.shape[0] == 0:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
+            elif name in self.scalar_names:
+                # ADR 0008: GMM NLL on the raw normalized scalar (both
+                # tokenisers) — no flow, no logdet
+                logits_pi, mu, log_sigma = unpack_gmm_params(
+                    pred.float(), self.scalar_gmm_k, self.modality_dims[name]
+                )
+                mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
+                n_present += 1
             elif self.tokeniser == "jetformer":
                 # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
                 # negative); z/logdet come clean from the embedding block
@@ -451,8 +464,12 @@ class AstroPT3Model(nn.Module):
         # these dict outputs pass through the PipelineBlock locally)
         jet_keys = set()
         if config.tokeniser == "jetformer":
-            jet_keys = {f"{name}_z" for name in config.modality_names()} | {
-                f"{name}_logdet" for name in config.modality_names()
+            # scalar modalities emit no z/logdet — they bypass the flow
+            patch_names = [
+                name for name in config.modality_names() if not config.modality(name).get("scalar", False)
+            ]
+            jet_keys = {f"{name}_z" for name in patch_names} | {
+                f"{name}_logdet" for name in patch_names
             }
         self.jet_keys = jet_keys
 
