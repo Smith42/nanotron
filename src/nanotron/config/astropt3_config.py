@@ -150,6 +150,11 @@ class AstroPT3StreamingDatasetsArgs:
     stream used by smoke runs and gpu-marked tests. Any other value raises
     in the loader, so a config still naming the retired corpus fails loudly.
 
+    ``match_index`` is the precomputed crossmatch parquet built offline by
+    ``astro/scripts/build_match_index.py`` (ADR 0006). It is what makes the
+    PAIRED source exist: without it the corpus degrades to images + spectra
+    with no cross-modal sequences, which the loader logs rather than hiding.
+
     ``norm_stats`` optionally points at the data yaml holding the asinh
     p1/p99 calibration (``astro/configs/data/pilot_images_spectra.yaml``);
     without it the sequencer falls back to plain ``asinh(flux)`` (synthetic
@@ -163,6 +168,7 @@ class AstroPT3StreamingDatasetsArgs:
 
     data_root: str
     is_astropt3_streaming: bool = True
+    match_index: Optional[str] = None
     norm_stats: Optional[str] = None
     # synthetic stream controls (data_root == "synthetic")
     synthetic_image_only_fraction: float = 0.3
