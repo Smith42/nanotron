@@ -144,10 +144,11 @@ class AstroPT3Config(Qwen2Config):
 class AstroPT3StreamingDatasetsArgs:
     """``astropt3_streaming`` dataset type.
 
-    ``data_root`` points at a directory of pilot parquet shards written by
-    ``astro/scripts/prepare_pilot_data.py`` (the train split directory), or
-    the literal string ``"synthetic"`` for the offline synthetic stream used
-    by smoke runs and gpu-marked tests.
+    ``data_root`` is ``"mmu"`` — the MMU HATS catalogs streamed live from the
+    HF hub (ADR 0006; the local parquet reshard and its prep script are
+    gone) — or the literal string ``"synthetic"`` for the offline synthetic
+    stream used by smoke runs and gpu-marked tests. Any other value raises
+    in the loader, so a config still naming the retired corpus fails loudly.
 
     ``norm_stats`` optionally points at the data yaml holding the asinh
     p1/p99 calibration (``astro/configs/data/pilot_images_spectra.yaml``);
@@ -163,10 +164,6 @@ class AstroPT3StreamingDatasetsArgs:
     data_root: str
     is_astropt3_streaming: bool = True
     norm_stats: Optional[str] = None
-    shuffle_buffer_size: int = 0
-    # ADR 0005: list each spectrum-only shard ({data_root}/spectra/*.parquet)
-    # this many times per epoch — the shard-level oversampling knob
-    spectra_oversample: int = 1
     # synthetic stream controls (data_root == "synthetic")
     synthetic_image_only_fraction: float = 0.3
     synthetic_spectrum_only_fraction: float = 0.0
