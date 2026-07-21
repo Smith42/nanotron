@@ -155,6 +155,12 @@ class AstroPT3StreamingDatasetsArgs:
     PAIRED source exist: without it the corpus degrades to images + spectra
     with no cross-modal sequences, which the loader logs rather than hiding.
 
+    ``skim_images`` (ADR 0011, needs ``match_index``) turns the crossmatch
+    scan into a demux: one pass over the matched partitions yields both pairs
+    and image-only records skimmed from the otherwise-discarded unmatched rows,
+    so the standalone images-catalog download is dropped. Images-only skim;
+    spectra stay single-sourced. Off by default.
+
     ``norm_stats`` optionally points at the data yaml holding the asinh
     p1/p99 calibration (``astro/configs/data/pilot_images_spectra.yaml``);
     without it the sequencer falls back to plain ``asinh(flux)`` (synthetic
@@ -169,6 +175,7 @@ class AstroPT3StreamingDatasetsArgs:
     data_root: str
     is_astropt3_streaming: bool = True
     match_index: Optional[str] = None
+    skim_images: bool = False  # ADR 0011 image-only skim (needs match_index)
     norm_stats: Optional[str] = None
     # synthetic stream controls (data_root == "synthetic")
     synthetic_image_only_fraction: float = 0.3
