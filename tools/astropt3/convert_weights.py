@@ -23,10 +23,10 @@ GPU): the nanotron model imports flash-attn.
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
-import nanotron
 import torch
+
 from nanotron.config import AstroPT3Config as NanotronAstroPT3Config
 from nanotron.config import (
     OneForwardOneBackwardPipelineEngine,
@@ -34,7 +34,10 @@ from nanotron.config import (
     PipelineEngine,
     TensorParallelLinearMode,
 )
+from nanotron.models import build_model
 from nanotron.models.astropt3 import AstroPT3ForTraining
+from nanotron.parallel import ParallelContext
+from nanotron.serialize import load_weights
 from nanotron.trainer import mark_tied_parameters
 
 # HF-side parameter prefix -> nanotron parameter prefix, applied to the
@@ -73,7 +76,7 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
         encoder_weights = decoder_weights = ["c_fc.weight"]
     else:  # aim
         encoder_weights = decoder_weights = ["c_fc.weight", "c_proj.weight"]
-    for mod in config.modalities:
+    for mod in config.modalities or ():
         name = mod["name"]
         # ADR 0008 scalars: GMMHead (proj.weight) under every tokeniser, no flow
         scalar = mod.get("scalar", False)
@@ -124,6 +127,7 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "image_norm_divisor": "image_norm_divisor",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
+        "loss_aggregation": "loss_aggregation",
         "jetformer_flow_steps": "jetformer_flow_steps",
         "jetformer_flow_hidden": "jetformer_flow_hidden",
         "jetformer_gmm_k": "jetformer_gmm_k",
@@ -176,16 +180,20 @@ def load_nanotron_model(
 ) -> AstroPT3ForTraining:
     """Build an AstroPT3ForTraining (TP=PP=DP=1) and optionally load weights."""
     if model_config is None:
-        assert checkpoint_path is not None
-        with open(checkpoint_path / "model_config.json") as f:
-            model_config = NanotronAstroPT3Config(**json.load(f))
+        if checkpoint_path is None:
+            raise ValueError("model_config or checkpoint_path is required")
+        try:
+            with open(checkpoint_path / "model_config.json") as file:
+                model_config = NanotronAstroPT3Config(**json.load(file))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ValueError(f"cannot load model config from {checkpoint_path}") from error
     parallel_config = make_parallel_config()
-    parallel_context = nanotron.parallel.ParallelContext(
+    parallel_context = ParallelContext(
         data_parallel_size=parallel_config.dp,
         pipeline_parallel_size=parallel_config.pp,
         tensor_parallel_size=parallel_config.tp,
     )
-    nanotron_model = nanotron.models.build_model(
+    nanotron_model = build_model(
         model_builder=lambda: AstroPT3ForTraining(
             config=model_config,
             parallel_context=parallel_context,
@@ -198,7 +206,5 @@ def load_nanotron_model(
     )
     mark_tied_parameters(model=nanotron_model, parallel_context=parallel_context)
     if checkpoint_path is not None:
-        nanotron.serialize.load_weights(
-            model=nanotron_model, parallel_context=parallel_context, root_folder=checkpoint_path
-        )
-    return nanotron_model
+        load_weights(model=nanotron_model, parallel_context=parallel_context, root_folder=checkpoint_path)
+    return cast(AstroPT3ForTraining, nanotron_model)

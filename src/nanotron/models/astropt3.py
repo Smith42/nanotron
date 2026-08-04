@@ -41,7 +41,8 @@ parameters.
 """
 
 import math
-from typing import Dict, Optional, Union
+from contextlib import nullcontext
+from typing import Dict, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -263,12 +264,17 @@ class AstroPT3Embedding(nn.Module):
     ):
         super().__init__()
         self.random_states = random_states
+        tp_mode = (
+            parallel_config.tp_mode
+            if parallel_config is not None and parallel_config.tp_mode is not None
+            else TensorParallelLinearMode.ALL_REDUCE
+        )
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             padding_idx=config.pad_token_id,
             pg=tp_pg,
-            mode=parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE,
+            mode=tp_mode,
         )
         self.encoders = nn.ModuleDict(
             {
@@ -282,9 +288,7 @@ class AstroPT3Embedding(nn.Module):
         self.tokeniser = config.tokeniser
         # ADR 0008: scalar modalities never flow — raw normalized value is
         # both the embedded input and the GMM target (mirrors the HF side)
-        self.scalar_names = {
-            name for name in config.modality_names() if config.modality(name).get("scalar", False)
-        }
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
         if config.tokeniser == "jetformer":
             self.flows = nn.ModuleDict(
                 {
@@ -307,7 +311,7 @@ class AstroPT3Embedding(nn.Module):
             self.jet_noise_frac = 1.0
 
     def set_jet_noise_frac(self, frac: float):
-        self.jet_noise_frac = float(min(max(frac, 0.0), 1.0))
+        self.jet_noise_frac = min(max(frac, 0.0), 1.0)
 
     def forward(
         self,
@@ -329,16 +333,22 @@ class AstroPT3Embedding(nn.Module):
                 z, logdet = self.flows[name](values)
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
-                sigma = self.jetformer_noise_max + (
-                    self.jetformer_noise_min - self.jetformer_noise_max
-                ) * self.jet_noise_frac
+                sigma = (
+                    self.jetformer_noise_max
+                    + (self.jetformer_noise_min - self.jetformer_noise_max) * self.jet_noise_frac
+                )
                 values = z
                 if self.training and sigma > 0:
                     # the noise must be IDENTICAL across TP ranks or the
                     # replicated-hidden-stream contract breaks — draw it under
                     # the trainer's tp_synced random state
-                    synced = self.random_states is not None and "tp_synced" in self.random_states
-                    with branch_random_state(self.random_states, "tp_synced", enabled=synced):
+                    random_state = (
+                        branch_random_state(self.random_states, "tp_synced", enabled=True)
+                        if self.random_states is not None
+                        and "tp_synced" in self.random_states
+                        else nullcontext()
+                    )
+                    with random_state:
                         values = z + sigma * torch.randn_like(z)
             content = encoder(values) + self.pos_embeds[name](modality_positions[name]).to(input_embeds.dtype)
             delta = delta.index_put((modality_masks[name].view(-1),), content.to(input_embeds.dtype))
@@ -351,20 +361,22 @@ class AstroPT3ModalityHead(nn.Module):
     def __init__(self, config: AstroPT3Config):
         super().__init__()
         scalar_names = {
-            name for name in config.modality_names() if config.modality(name).get("scalar", False)
+            name
+            for name in config.modality_names()
+            if config.modality(name).get("scalar", False)
         }
-
-        def build_head(name):
-            # ADR 0008: scalar modalities are GMM-headed under BOTH
-            # tokenisers ({m}_pred stays one tensor, the raw K*(1+2D)
-            # projection unpacked inside the loss)
+        decoders = {}
+        for name in config.modality_names():
+            input_size = config.modality(name)["input_size"]
+            # ADR 0008 scalars are GMM-headed under both tokenisers.
             if name in scalar_names:
-                return GMMHead(config.hidden_size, config.modality(name)["input_size"], config.scalar_gmm_k)
-            if config.tokeniser == "jetformer":
-                return GMMHead(config.hidden_size, config.modality(name)["input_size"], config.jetformer_gmm_k)
-            return Decoder(config.hidden_size, config.modality(name)["input_size"], config.tokeniser)
-
-        self.decoders = nn.ModuleDict({name: build_head(name) for name in config.modality_names()})
+                decoder = GMMHead(config.hidden_size, input_size, config.scalar_gmm_k)
+            elif config.tokeniser == "jetformer":
+                decoder = GMMHead(config.hidden_size, input_size, config.jetformer_gmm_k)
+            else:
+                decoder = Decoder(config.hidden_size, input_size, config.tokeniser)
+            decoders[name] = decoder
+        self.decoders = nn.ModuleDict(decoders)
 
     def forward(
         self,
@@ -382,25 +394,23 @@ class AstroPT3ModalityHead(nn.Module):
 
 
 class AstroPT3Loss(nn.Module):
-    """Weighted mean of per-modality Huber losses (astroPT semantics).
+    """ADR 0013 family-balanced modality loss, in fp32.
 
-    Mirrors the HF side: each present modality contributes
-    ``loss_weight * huber(pred, target)``; the total is divided by the number
-    of modalities present in the micro-batch. Absent modalities contribute
-    ``0 * pred.sum()`` to keep their decoder in the graph for DDP. Loss math
-    runs in fp32.
+    Present modalities are averaged within image/spectrum/scalar, then present
+    family means are combined at 1:1:0.1. Absent modalities still contribute
+    ``0 * pred.sum()`` to keep their decoders in the DDP graph.
     """
 
     def __init__(self, config: AstroPT3Config):
         super().__init__()
         self.tokeniser = config.tokeniser
         self.huber_delta = config.huber_delta
+        self.loss_aggregation = config.loss_aggregation
         self.gmm_k = config.jetformer_gmm_k
         self.scalar_gmm_k = config.scalar_gmm_k
-        self.scalar_names = {
-            name for name in config.modality_names() if config.modality(name).get("scalar", False)
-        }
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
+        self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
         self.loss_weights = {name: config.modality(name).get("loss_weight", 1.0) for name in config.modality_names()}
 
     def forward(
@@ -408,37 +418,56 @@ class AstroPT3Loss(nn.Module):
         modality_values: Dict[str, torch.Tensor],  # name -> [n_m, input_size] (affine targets)
         **predictions: torch.Tensor,  # {name}_pred [+ jetformer {name}_z / {name}_logdet]
     ) -> Dict[str, torch.Tensor]:
-        total = None
-        n_present = 0
+        graph_zero = None
+        losses_by_family = {"image": [], "spectrum": [], "scalar": []}
+        legacy_terms = []
         out = {}
-        for name, weight in self.loss_weights.items():
+        for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
-            if pred.shape[0] == 0:
+            present = pred.shape[0] > 0
+            if not present:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
             elif name in self.scalar_names:
                 # ADR 0008: GMM NLL on the raw normalized scalar (both
                 # tokenisers) — no flow, no logdet
-                logits_pi, mu, log_sigma = unpack_gmm_params(
-                    pred.float(), self.scalar_gmm_k, self.modality_dims[name]
-                )
+                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
                 mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
-                n_present += 1
             elif self.tokeniser == "jetformer":
                 # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
                 # negative); z/logdet come clean from the embedding block
-                logits_pi, mu, log_sigma = unpack_gmm_params(
-                    pred.float(), self.gmm_k, self.modality_dims[name]
-                )
+                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
                 nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
                 mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
-                n_present += 1
             else:
                 target = modality_values[name]
                 mod_loss = F.huber_loss(pred.float(), target.float(), delta=self.huber_delta)
-                n_present += 1
-            total = mod_loss * weight if total is None else total + mod_loss * weight
+            if present:
+                losses_by_family[self.modality_families[name]].append(mod_loss)
+                legacy_terms.append(self.loss_weights[name] * mod_loss)
+            else:
+                graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
-        out["loss"] = total / max(n_present, 1)
+
+        total = graph_zero
+        weight_sum = 0.0
+        family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
+        for family, losses in losses_by_family.items():
+            if not losses:
+                continue
+            family_loss = torch.stack(losses).mean()
+            out[f"{family}_family_loss"] = family_loss
+            weighted = family_weights[family] * family_loss
+            total = weighted if total is None else total + weighted
+            weight_sum += family_weights[family]
+        if total is None:
+            raise ValueError("AstroPT3 loss received no modality predictions")
+        if self.loss_aggregation == "family":
+            out["loss"] = total / weight_sum if weight_sum else total
+        else:
+            legacy_total = torch.stack(legacy_terms).sum() if legacy_terms else total
+            if graph_zero is not None:
+                legacy_total = legacy_total + graph_zero
+            out["loss"] = legacy_total / max(len(legacy_terms), 1)
         return out
 
 
@@ -465,12 +494,8 @@ class AstroPT3Model(nn.Module):
         jet_keys = set()
         if config.tokeniser == "jetformer":
             # scalar modalities emit no z/logdet — they bypass the flow
-            patch_names = [
-                name for name in config.modality_names() if not config.modality(name).get("scalar", False)
-            ]
-            jet_keys = {f"{name}_z" for name in patch_names} | {
-                f"{name}_logdet" for name in patch_names
-            }
+            patch_names = [name for name in config.modality_names() if not config.modality(name).get("scalar", False)]
+            jet_keys = {f"{name}_z" for name in patch_names} | {f"{name}_logdet" for name in patch_names}
         self.jet_keys = jet_keys
 
         self.token_position_embeddings = PipelineBlock(
@@ -540,6 +565,8 @@ class AstroPT3Model(nn.Module):
         # Position restarts (including position-0 pads, each its own segment)
         # define the packed-document boundaries, exactly as upstream qwen.
         cu_seqlens = None
+        if isinstance(position_ids, TensorPointer):
+            raise ValueError("AstroPT3 requires PP=1 tensor inputs")
         if position_ids.numel() > 0:
             start_indices = torch.where(position_ids.view(-1) == 0)[0]
             cu_seqlens = torch.cat(
@@ -565,9 +592,7 @@ class AstroPT3Model(nn.Module):
         model_config = self.config
         d_ff = model_config.intermediate_size
         d_qkv = model_config.hidden_size // model_config.num_attention_heads
-        head_cost = sum(
-            2 * model_config.hidden_size * m["input_size"] for m in model_config.modalities
-        )
+        head_cost = sum(2 * model_config.hidden_size * m["input_size"] for m in model_config.modalities or ())
         return {
             Qwen2DecoderLayer: 4 * model_config.num_attention_heads * d_qkv * model_config.hidden_size
             + 3 * d_ff * model_config.hidden_size,
@@ -633,7 +658,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         **modality_tensors: Union[torch.Tensor, TensorPointer],  # {m}_values / {m}_positions / {m}_mask
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-        names = self.config.modality_names()
+        names = cast(AstroPT3Config, self.config).modality_names()
         modality_values = {name: modality_tensors[f"{name}_values"] for name in names}
         modality_positions = {name: modality_tensors[f"{name}_positions"] for name in names}
         modality_masks = {name: modality_tensors[f"{name}_mask"] for name in names}
@@ -671,7 +696,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
         else:
             raise ValueError(f"Unknown init method {init_method}")
 
-        parametrizator = parametrizator_cls(config=config)
+        parametrizator = parametrizator_cls(config=config)  # type: ignore[arg-type]
         parametrizator.MODULE_TO_PARAMETRIZE[nn.Linear] = parametrizator.MODULE_TO_PARAMETRIZE[
             TensorParallelColumnLinear
         ]
@@ -713,12 +738,18 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             assert full_param_name not in initialized_parameters
             initialized_parameters.add(full_param_name)
 
-        assert initialized_parameters == {
-            param.get_tied_info().get_full_name_from_module_id_to_prefix(module_id_to_prefix=module_id_to_prefix)
-            if param.is_tied
-            else name
-            for name, param in model.named_parameters()
-        }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
+        expected_parameters = set()
+        for name, parameter in model.named_parameters():
+            param = cast(NanotronParameter, parameter)
+            expected_parameters.add(
+                param.get_tied_info().get_full_name_from_module_id_to_prefix(module_id_to_prefix=module_id_to_prefix)
+                if param.is_tied
+                else name
+            )
+        assert initialized_parameters == expected_parameters, (
+            "Somehow the initialized set of parameters don't match:\n"
+            f" - Expected: {expected_parameters}\n - Got: {initialized_parameters}"
+        )
 
     def get_embeddings_lm_head_tied_names(self):
         return []  # no lm_head to tie

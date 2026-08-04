@@ -2,16 +2,18 @@
 
 Two additions over Qwen2Config:
 
-- ``modalities``: list of per-modality dicts (name/input_size/patch_size/
-  pos_type/pos_input_size/max_positions/loss_weight) mirroring the HF-side
+- ``modalities``: list of per-modality dicts (name/input_size/patch_size,
+  position contract, family/source/record keys, token ids, legacy loss weight)
+  mirroring the HF-side
   ``astropt3.configuration_astropt3.DEFAULT_MODALITIES``. Registry order is
   alphabetical by name everywhere.
 - ``AstroPT3StreamingDatasetsArgs``: the ``astropt3_streaming`` dataset type
   consumed by ``run_train.py`` (packed multimodal micro-batches built by the
   ``astropt3`` package's ``data/nanotron_loader.py``).
 
-The special-token vocabulary is frozen at 64 ids (see the astropt3 package's
-``tokenization.py``); there is no text vocab and no lm_head.
+Existing token ids 0–16 are frozen. ADR 0013 configs consume reserved blocks
+through id 63 before explicitly enlarging ``vocab_size``; there is no text
+vocabulary and no lm_head.
 """
 
 from dataclasses import dataclass, field
@@ -31,6 +33,10 @@ DEFAULT_MODALITIES = [
         "pos_type": "index",
         "pos_input_size": 1,
         "max_positions": 361,
+        "family": "image",
+        "source": "legacy",
+        "record_keys": ["image"],
+        "token_ids": [2, 3, 4],
         "loss_weight": 1.0,
     },
     {
@@ -40,6 +46,10 @@ DEFAULT_MODALITIES = [
         "pos_type": "continuous",
         "pos_input_size": 1,
         "max_positions": 1024,
+        "family": "spectrum",
+        "source": "desi",
+        "record_keys": ["spectrum"],
+        "token_ids": [5, 6, 7],
         "loss_weight": 1.0,
     },
     {
@@ -49,6 +59,10 @@ DEFAULT_MODALITIES = [
         "pos_type": "index",
         "pos_input_size": 1,
         "max_positions": 1,
+        "family": "scalar",
+        "source": "desi",
+        "record_keys": ["Z"],
+        "token_ids": [8, 9, 10],
         "loss_weight": 0.1,
         "scalar": True,
     },
@@ -59,6 +73,10 @@ DEFAULT_MODALITIES = [
         "pos_type": "index",
         "pos_input_size": 1,
         "max_positions": 1,
+        "family": "scalar",
+        "source": "legacy",
+        "record_keys": ["ebv"],
+        "token_ids": [11, 12, 13],
         "loss_weight": 0.1,
         "scalar": True,
     },
@@ -69,6 +87,10 @@ DEFAULT_MODALITIES = [
         "pos_type": "index",
         "pos_input_size": 1,
         "max_positions": 1,
+        "family": "scalar",
+        "source": "legacy",
+        "record_keys": ["flux_g", "flux_r", "flux_z"],
+        "token_ids": [14, 15, 16],
         "loss_weight": 0.1,
         "scalar": True,
     },
@@ -85,8 +107,9 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    tokeniser: str = "affine"  # "affine" (default), "aim" (astroPT MLP) or "jetformer" (flow + GMM)
+    tokeniser: str = field(default="affine")  # affine, aim, or jetformer
     huber_delta: float = 1.0
+    loss_aggregation: str = "legacy_modality_mean"
     vocab_size: int = 64
     tie_word_embeddings: bool = False
     # jetformer tokeniser (mirrors the HF-side AstroPT3Config defaults):
@@ -125,19 +148,62 @@ class AstroPT3Config(Qwen2Config):
         self.no_rope_layer = None
         super().__post_init__()
         self.no_rope_layer = no_rope_layer
-        if self.modalities is None:
-            self.modalities = [dict(m) for m in DEFAULT_MODALITIES]
-        assert not self.tie_word_embeddings, "astropt3 has no lm_head to tie"
-        assert self.tokeniser in ("affine", "aim", "jetformer"), f"unknown tokeniser {self.tokeniser!r}"
-        names = [m["name"] for m in self.modalities]
-        assert len(set(names)) == len(names), f"duplicate modality names: {names}"
+        raw_modalities = (
+            [dict(modality) for modality in DEFAULT_MODALITIES] if self.modalities is None else self.modalities
+        )
+        legacy = {modality["name"]: modality for modality in DEFAULT_MODALITIES}
+        completed = []
+        used_token_ids = {0, 1}
+        for raw in raw_modalities:
+            modality = dict(raw)
+            defaults = legacy.get(modality.get("name"), {})
+            for key in ("family", "source", "record_keys", "token_ids"):
+                if key not in modality and key in defaults:
+                    modality[key] = defaults[key]
+            missing = [key for key in ("family", "source", "record_keys", "token_ids") if key not in modality]
+            if missing:
+                raise ValueError(f"modality {modality.get('name')!r} is missing {', '.join(missing)}")
+            try:
+                token_ids = tuple(int(token_id) for token_id in modality["token_ids"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"modality {modality['name']!r} has invalid token_ids"
+                ) from error
+            if len(token_ids) != 3 or token_ids != tuple(
+                range(token_ids[0], token_ids[0] + 3)
+            ):
+                raise ValueError(
+                    f"modality {modality['name']!r} token_ids must be three consecutive ids"
+                )
+            modality["token_ids"] = list(token_ids)
+            overlap = used_token_ids.intersection(token_ids)
+            if overlap:
+                raise ValueError(f"modality {modality['name']!r} token_ids collide at {sorted(overlap)}")
+            if modality["family"] not in ("image", "spectrum", "scalar"):
+                raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
+            modality["scalar"] = modality["family"] == "scalar"
+            used_token_ids.update(token_ids)
+            completed.append(modality)
+        self.modalities = completed
+        required_vocab = max(64, max(used_token_ids) + 1)
+        if self.vocab_size < required_vocab:
+            raise ValueError(f"vocab_size={self.vocab_size} cannot hold modality token id {required_vocab - 1}")
+        if self.tie_word_embeddings:
+            raise ValueError("astropt3 has no lm_head to tie")
+        if self.tokeniser not in ("affine", "aim", "jetformer"):
+            raise ValueError(f"unknown tokeniser {self.tokeniser!r}")
+        if self.loss_aggregation not in ("legacy_modality_mean", "family"):
+            raise ValueError(f"unknown loss_aggregation {self.loss_aggregation!r}")
+        names = [modality["name"] for modality in completed]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate modality names: {names}")
 
     def modality_names(self) -> List[str]:
         """Alphabetical registry order — fixes sequence order everywhere."""
-        return sorted(m["name"] for m in self.modalities)
+        return sorted(modality["name"] for modality in self.modalities or ())
 
     def modality(self, name: str) -> dict:
-        return next(m for m in self.modalities if m["name"] == name)
+        return next(modality for modality in self.modalities or () if modality["name"] == name)
 
 
 @dataclass
