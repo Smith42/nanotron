@@ -151,14 +151,19 @@ class AstroPT3StreamingDatasetsArgs:
     in the loader, so a config still naming the retired corpus fails loudly.
 
     ``match_index`` is the precomputed crossmatch parquet built offline by
-    ``astro/scripts/build_match_index.py`` (ADR 0006). It is what makes the
-    PAIRED source exist: without it the corpus degrades to images + spectra
-    with no cross-modal sequences, which the loader logs rather than hiding.
+    ``astro/scripts/build_match_index.py`` (ADR 0006). It is **mandatory** for
+    ``data_root: mmu`` and DEFINES the corpus (ADR 0011 as amended
+    2026-08-04): one pass over its LegacySurvey cells emits matched pairs,
+    unmatched images, and the globally unmatched spectra of the cells it owns.
+    There is no standalone source, no weighting, and no degrade-to-images
+    fallback — the loader raises without an index. ``$ASTROPT3_MATCH_INDEX``
+    is the fallback when the field is unset.
 
-    With a ``match_index`` the crossmatch scan is a demux (ADR 0011, adopted
-    after the 2026-07-21 A/B): one pass over the matched partitions yields
-    both pairs and image-only records skimmed from the otherwise-discarded
-    unmatched rows, so there is no standalone images-catalog download.
+    ``num_loading_workers`` is capped by the corpus, not the machine: the
+    published index holds 173 cells (165 train), partitions are dealt to DP
+    ranks, so a rank owns ``floor(165 / dp)`` of them and the loader raises
+    if it has more workers than that. ``datasets`` would only warn and
+    silently stop the surplus.
 
     ``norm_stats`` optionally points at the data yaml holding the asinh
     p1/p99 calibration (``astro/configs/data/pilot_images_spectra.yaml``);
