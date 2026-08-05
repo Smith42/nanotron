@@ -447,12 +447,18 @@ class AstroPT3Loss(nn.Module):
             else:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
+            reference_loss = mod_loss  # device/dtype for absent families
 
         total = graph_zero
         weight_sum = 0.0
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
         for family, losses in losses_by_family.items():
             if not losses:
+                # PipelineBlock asserts an exact output-key set, so a family
+                # absent from THIS batch still has to report a key; it stays
+                # out of the weighted total, and 0.0 reads as "no targets"
+                # against the per-modality losses beside it
+                out[f"{family}_family_loss"] = torch.zeros_like(reference_loss)
                 continue
             family_loss = torch.stack(losses).mean()
             out[f"{family}_family_loss"] = family_loss
@@ -646,7 +652,11 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             module_input_keys={"modality_values"}
             | {f"{name}_pred" for name in config.modality_names()}
             | self.model.jet_keys,
-            module_output_keys={"loss"} | {f"{name}_loss" for name in config.modality_names()},
+            module_output_keys={"loss"}
+            | {f"{name}_loss" for name in config.modality_names()}
+            # families are the fixed image/spectrum/scalar set (config validates
+            # it), and the loss emits all three every batch to keep this static
+            | {f"{family}_family_loss" for family in ("image", "spectrum", "scalar")},
         )
         self.parallel_context = parallel_context
         self.config = config
