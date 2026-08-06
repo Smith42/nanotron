@@ -252,3 +252,8 @@ class AstroPT3StreamingDatasetsArgs:
     # append one object_id line per trained object to {path}.dp{rank} —
     # the no-replay audit trail for kill/resume verification
     object_id_log: Optional[str] = None
+    # Emit each downloaded record this many times, each under a different
+    # ADR 0008 span order. The corpus is transfer-bound, so extra
+    # factorisations of a record already in memory cost GPU, not bytes.
+    # 1 is the historical behaviour.
+    ar_replicas: int = 1
