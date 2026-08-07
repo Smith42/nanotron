@@ -804,6 +804,38 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
+        # astropt3 (ADR 0014 §2a/§3): drain the loader telemetry for this step
+        # and log MFU DECOMPOSED. Headline MFU is refused as an acceptance
+        # criterion (§11) because it is gameable by duplication and padding
+        # and confounds pipeline with model-shape effects — so the three
+        # factors always travel together, alongside the per-modality token
+        # composition (§4) that says what the step actually trained on.
+        if hasattr(self.unwrapped_model, "get_mfu_report"):
+            try:
+                from astropt3.data import telemetry as astropt3_telemetry
+            except ImportError:
+                astropt3_telemetry = None
+            if astropt3_telemetry is not None and astropt3_telemetry.telemetry_dir():
+                step_record = astropt3_telemetry.drain_step()
+                report = self.unwrapped_model.get_mfu_report(
+                    iteration_time_in_sec=elapsed_time_per_iteration_ms / 1000,
+                    sequence_length=self.sequence_length,
+                    global_batch_size=self.global_batch_size,
+                    telemetry=step_record,
+                )
+                for key, value in report.items():
+                    basic_log_entries.append(LogItem(key, value, "human_format"))
+                total_loss_tokens = sum(step_record.get("loss_tokens", {}).values())
+                for name, count in sorted(step_record.get("loss_tokens", {}).items()):
+                    basic_log_entries.append(
+                        LogItem(f"composition/{name}", count / max(total_loss_tokens, 1), "human_format")
+                    )
+                astropt3_telemetry.write_step(
+                    self.iteration_step,
+                    {**step_record, **report},
+                    rank=dp_cp_rank,
+                )
+
         # astropt3: surface per-modality losses (rank-local like z_loss —
         # not DP-synced, logging only). The model emits {name}_loss for every
         # modality on every micro-batch (0.0 when absent from the batch).

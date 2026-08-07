@@ -182,6 +182,17 @@ class AstroPT3Config(Qwen2Config):
             if modality["family"] not in ("image", "spectrum", "scalar"):
                 raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
             modality["scalar"] = modality["family"] == "scalar"
+            # ADR 0014 §8 image factorisation; mirrors the HF-side
+            # ModalityConfig defaults so a fused config need not name them.
+            # The heavy validation lives there — this side only has to carry
+            # the fields into the sequencer and the resume fingerprint.
+            modality.setdefault("channel_tokenization", "fused")
+            modality.setdefault("band_order", [])
+            if modality["channel_tokenization"] not in ("fused", "per_band"):
+                raise ValueError(
+                    f"modality {modality['name']!r} has invalid channel_tokenization "
+                    f"{modality['channel_tokenization']!r} (fused | per_band)"
+                )
             used_token_ids.update(token_ids)
             completed.append(modality)
         self.modalities = completed
@@ -255,5 +266,12 @@ class AstroPT3StreamingDatasetsArgs:
     # Emit each downloaded record this many times, each under a different
     # ADR 0008 span order. The corpus is transfer-bound, so extra
     # factorisations of a record already in memory cost GPU, not bytes.
-    # 1 is the historical behaviour.
+    # 1 is the historical behaviour. ADR 0014 §7a additionally refuses
+    # replicas that would repeat an order (one-span records get none).
     ar_replicas: int = 1
+    # ADR 0014 §7b. "decorrelated" (default) puts a base object's replicas in
+    # different packed rows, since document masking stops cross-attention but
+    # not gradient repetition inside a batch. "adjacent" is the pre-§7b
+    # behaviour, kept only so the B1 benchmark arm reproduces the measured
+    # result on the same footing.
+    replica_placement: str = "decorrelated"

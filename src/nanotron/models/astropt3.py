@@ -41,6 +41,7 @@ parameters.
 """
 
 import math
+import os
 from contextlib import nullcontext
 from typing import Dict, Optional, Union, cast
 
@@ -393,6 +394,86 @@ class AstroPT3ModalityHead(nn.Module):
         return out
 
 
+# --- ADR 0014 §2a: MFU accounting -------------------------------------------
+# The backbone estimate alone flatters a 70M model with 47 modality heads, so
+# the encoders, position embedders, decoders/GMM heads and jetformer flows are
+# priced here. Everything below is FORWARD flops per token of that modality;
+# callers multiply by 3 for fwd+bwd, matching qwen's get_flops convention.
+
+# bf16 dense peak, no sparsity credit (ADR 0014 §2a). Override with
+# $ASTROPT3_PEAK_TFLOPS on a device not listed here.
+_PEAK_TFLOPS = {
+    "A100": 312.0,
+    "H100": 989.0,
+    "H200": 989.0,
+    "GH200": 989.0,
+    "L40": 181.0,
+}
+
+
+def peak_tflops_per_gpu() -> Optional[float]:
+    """Accelerator bf16 dense peak, for the MFU denominator."""
+    override = os.environ.get("ASTROPT3_PEAK_TFLOPS")
+    if override:
+        return float(override)
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_name()
+    for key, value in _PEAK_TFLOPS.items():
+        if key in name:
+            return value
+    return None
+
+
+def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
+    """Forward FLOPs per loss-bearing token, per modality.
+
+    Priced against the modules in this file: :class:`Encoder`,
+    :class:`PositionEmbedder`, :class:`Decoder`/:class:`GMMHead` and, under
+    the jetformer tokeniser, :class:`TinyFlow1D`. A linear layer costs
+    ``2 * in * out``; an index position embedding is a lookup and costs
+    nothing.
+
+    ADR 0014 §3 requires this to be recomputed per (model config,
+    tokenisation policy) — per-band changes both the token count and the head
+    width, so arms must never share a pinned constant.
+    """
+    hidden = config.hidden_size
+    per_token: Dict[str, float] = {}
+    for name in config.modality_names():
+        modality = config.modality(name)
+        width = modality["input_size"]
+        scalar = modality.get("scalar", False)
+
+        if config.tokeniser == "aim":
+            encoder = 2 * width * (4 * hidden) + 2 * (4 * hidden) * hidden
+        else:  # affine / jetformer both use one Linear
+            encoder = 2 * width * hidden
+        flops = encoder
+
+        if modality.get("pos_type", "index") == "continuous":
+            flops += 2 * modality.get("pos_input_size", 1) * hidden
+
+        if scalar:
+            k = config.scalar_gmm_k
+            flops += 2 * hidden * k * (1 + 2 * width)
+        elif config.tokeniser == "jetformer":
+            k = config.jetformer_gmm_k
+            flops += 2 * hidden * k * (1 + 2 * width)
+            # TinyFlow1D: per coupling block, Linear(D/2 -> H) + Linear(H -> D)
+            hidden_dim = config.jetformer_flow_hidden
+            flops += config.jetformer_flow_steps * (
+                2 * (width // 2) * hidden_dim + 2 * hidden_dim * width
+            )
+        elif config.tokeniser == "aim":
+            flops += 2 * hidden * (4 * hidden) + 2 * (4 * hidden) * width
+        else:
+            flops += 2 * hidden * width
+
+        per_token[name] = float(flops)
+    return per_token
+
+
 class AstroPT3Loss(nn.Module):
     """ADR 0013 family-balanced modality loss, in fp32.
 
@@ -622,6 +703,87 @@ class AstroPT3Model(nn.Module):
         hardware_flops_per_s = hardware_flops / (iteration_time_in_sec * world_size * 1e12)
         return model_flops_per_s, hardware_flops_per_s
 
+    def get_mfu_report(self, iteration_time_in_sec, sequence_length, global_batch_size, telemetry):
+        """ADR 0014 §2a: MFU, decomposed into the three factors that move it.
+
+            MFU = MFU_busy x (1 - stall_share) x utilisation_packing
+
+        The decomposition is the point. An undecomposed comparison between a
+        fused and a per-band arm confounds a data-pipeline effect
+        (``stall_share``) with a model-shape effect (``MFU_busy``) and
+        supports the wrong conclusion, which is why §11 refuses headline MFU
+        as an acceptance criterion.
+
+        ``telemetry`` is a drained ``astropt3.data.telemetry`` step record:
+        non-padding tokens, per-modality loss-bearing tokens, and the
+        main-process loader wait. Returns {} when it is absent (telemetry off)
+        or the accelerator peak is unknown.
+        """
+        world_size = self.parallel_context.world_pg.size()
+        if not telemetry or not telemetry.get("tokens_total"):
+            return {}
+        peak = peak_tflops_per_gpu()
+        if peak is None:
+            return {}
+
+        utilisation = telemetry["utilisation_packing"]
+        backbone, _ = get_flops(
+            num_layers=self.config.num_hidden_layers,
+            hidden_size=self.config.hidden_size,
+            num_heads=self.config.num_attention_heads,
+            num_key_value_heads=self.config.num_key_value_heads,
+            vocab_size=self.config.vocab_size,
+            ffn_hidden_size=self.config.intermediate_size,
+            seq_len=sequence_length,
+            batch_size=global_batch_size,
+        )
+        # padding earns no MFU credit (§2a): a padded-out packed row is wasted
+        # compute exactly as a stall is wasted time.
+        # ponytail: linear scaling, though the attention term is quadratic in
+        # seq_len. It errs toward OVER-counting (document masking already
+        # makes real attention block-diagonal and cheaper than full seq^2), so
+        # reported MFU is an upper bound. Model the block structure only if an
+        # arm is ever decided on the attention term alone.
+        backbone *= utilisation
+
+        per_token = modality_flops_per_token(self.config)
+        modality = 3 * sum(  # 1 fwd + 2 bwd, matching get_flops
+            count * per_token.get(name, 0.0)
+            for name, count in telemetry.get("loss_tokens", {}).items()
+        )
+        # telemetry counts this DP rank's micro-batches; the backbone estimate
+        # is already global, so scale the modality term the same way
+        modality *= world_size
+
+        total_flops = backbone + modality
+        elapsed = max(iteration_time_in_sec, 1e-9)
+        busy = max(elapsed - telemetry.get("loader_wait_s", 0.0), 1e-9)
+        stall_share = 1.0 - busy / elapsed
+        denominator = peak * 1e12 * world_size
+
+        loss_tokens = sum(telemetry.get("loss_tokens", {}).values()) or 1
+        return {
+            # step_seconds and model_flops are absolute so the offline report
+            # can time-weight them. A mean of per-step MFU (or of per-step
+            # stall_share) is NOT the run's MFU: this corpus is bimodal —
+            # most steps stall for nothing and a few stall for a minute — so
+            # averaging ratios buries exactly the behaviour being measured.
+            "step_seconds": elapsed,
+            "model_flops": total_flops,
+            "mfu": total_flops / (elapsed * denominator),
+            "mfu_busy": total_flops / (busy * denominator),
+            "stall_share": stall_share,
+            "utilisation_packing": utilisation,
+            "flops_per_token": total_flops / (3 * loss_tokens * world_size),
+            # deliberately NOT "model_tflops_per_gpu": nanotron logs its own
+            # backbone-only, padding-credited number under that name, and two
+            # LogItems with one key silently collide in wandb. This one counts
+            # the modality heads and refuses padding credit, so it reads lower.
+            "astropt3_tflops_per_gpu": total_flops / (elapsed * world_size * 1e12),
+            "peak_tflops_per_gpu": peak,
+            "loader_wait_s": telemetry.get("loader_wait_s", 0.0),
+        }
+
 
 class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
     def __init__(
@@ -769,3 +931,8 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)
+
+    def get_mfu_report(self, iteration_time_in_sec, sequence_length, global_batch_size, telemetry):
+        return self.model.get_mfu_report(
+            iteration_time_in_sec, sequence_length, global_batch_size, telemetry
+        )
