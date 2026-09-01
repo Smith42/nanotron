@@ -804,6 +804,38 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
+        # astropt3 (ADR 0014 §2a/§3): drain the loader telemetry for this step
+        # and log MFU DECOMPOSED. Headline MFU is refused as an acceptance
+        # criterion (§11) because it is gameable by duplication and padding
+        # and confounds pipeline with model-shape effects — so the three
+        # factors always travel together, alongside the per-modality token
+        # composition (§4) that says what the step actually trained on.
+        if hasattr(self.unwrapped_model, "get_mfu_report"):
+            try:
+                from astropt3.data import telemetry as astropt3_telemetry
+            except ImportError:
+                astropt3_telemetry = None
+            if astropt3_telemetry is not None and astropt3_telemetry.telemetry_dir():
+                step_record = astropt3_telemetry.drain_step()
+                report = self.unwrapped_model.get_mfu_report(
+                    iteration_time_in_sec=elapsed_time_per_iteration_ms / 1000,
+                    sequence_length=self.sequence_length,
+                    global_batch_size=self.global_batch_size,
+                    telemetry=step_record,
+                )
+                for key, value in report.items():
+                    basic_log_entries.append(LogItem(key, value, "human_format"))
+                total_loss_tokens = sum(step_record.get("loss_tokens", {}).values())
+                for name, count in sorted(step_record.get("loss_tokens", {}).items()):
+                    basic_log_entries.append(
+                        LogItem(f"composition/{name}", count / max(total_loss_tokens, 1), "human_format")
+                    )
+                astropt3_telemetry.write_step(
+                    self.iteration_step,
+                    {**step_record, **report},
+                    rank=dp_cp_rank,
+                )
+
         # astropt3: surface per-modality losses (rank-local like z_loss —
         # not DP-synced, logging only). The model emits {name}_loss for every
         # modality on every micro-batch (0.0 when absent from the batch).
@@ -1323,31 +1355,8 @@ class DistributedTrainer:
         save_random_states(
             random_states=self.random_states, parallel_context=self.parallel_context, root_folder=checkpoint_path
         )
-        # astropt3: persist the streaming-dataset position so a resumed run
-        # continues the stream instead of restarting it. `_ckpt_state` marks
-        # the astropt3 PackedMicroBatches dataset; loader_state_dict captures
-        # a torchdata StatefulDataLoader's per-worker states when
-        # num_loading_workers > 0, or the dataset's own state at workers == 0.
-        # One file per DP rank — streams are identical within a TP/CP group,
-        # so only their rank-0 writes. Written before latest.txt so a visible
-        # checkpoint always has complete stream state.
-        base_dl = getattr(self, "current_base_dl", None)
-        dataset = getattr(base_dl, "dataset", None)
-        if dataset is not None and hasattr(dataset, "_ckpt_state") and hasattr(dataset, "state_dict"):
-            from astropt3.data.nanotron_loader import loader_state_dict
-
-            dataset_state = loader_state_dict(base_dl)
-            if dataset_state is not None and (
-                dist.get_rank(self.parallel_context.tp_pg) == 0
-                and dist.get_rank(self.parallel_context.pp_pg) == 0
-                and dist.get_rank(self.parallel_context.cp_pg) == 0
-            ):
-                state_dir = checkpoint_path / "dataset_state"
-                state_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    dataset_state,
-                    state_dir / f"dp_{dist.get_rank(self.parallel_context.dp_pg)}.pt",
-                )
+        # ADR 0015: checkpoints persist model/optimizer/scheduler/RNG only;
+        # the LSDB stream is cursorless and starts fresh on every resume.
         with open(checkpoints_path / "latest.txt", mode="w") as fo:
             fo.write(f"{self.iteration_step}")
 
