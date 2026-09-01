@@ -219,59 +219,13 @@ class AstroPT3Config(Qwen2Config):
 
 @dataclass
 class AstroPT3StreamingDatasetsArgs:
-    """``astropt3_streaming`` dataset type.
+    """LSDB ``InfiniteStream`` dataset type (ADR 0015).
 
-    ``data_root`` is ``"mmu"`` — the MMU HATS catalogs streamed live from the
-    HF hub (ADR 0006; the local parquet reshard and its prep script are
-    gone) — or the literal string ``"synthetic"`` for the offline synthetic
-    stream used by smoke runs and gpu-marked tests. Any other value raises
-    in the loader, so a config still naming the retired corpus fails loudly.
-
-    ``match_index`` is the precomputed crossmatch parquet built offline by
-    ``astro/scripts/build_match_index.py`` (ADR 0006). It is **mandatory** for
-    ``data_root: mmu`` and DEFINES the corpus (ADR 0011 as amended
-    2026-08-04): one pass over its LegacySurvey cells emits matched pairs,
-    unmatched images, and the globally unmatched spectra of the cells it owns.
-    There is no standalone source, no weighting, and no degrade-to-images
-    fallback — the loader raises without an index. ``$ASTROPT3_MATCH_INDEX``
-    is the fallback when the field is unset.
-
-    ``num_loading_workers`` is capped by the corpus, not the machine: the
-    published index holds 173 cells (165 train), partitions are dealt to DP
-    ranks, so a rank owns ``floor(165 / dp)`` of them and the loader raises
-    if it has more workers than that. ``datasets`` would only warn and
-    silently stop the surplus.
-
-    ``norm_stats`` optionally points at the data yaml holding the asinh
-    p1/p99 calibration (``astro/configs/data/pilot_images_spectra.yaml``);
-    without it the sequencer falls back to plain ``asinh(flux)`` (synthetic
-    convention).
-
-    NOTE: with DP > 1 the flattened per-modality tensors have different
-    shapes on each DP rank, so ``general.ignore_sanity_checks`` must stay
-    true (the DP input-difference sanity check all-gathers tensors and
-    assumes equal shapes).
+    The catalog and stream policy are fixed in ``astropt3``. DataLoader
+    workers provide concurrency; consumers deliberately have no ownership or
+    resumable cursor.
     """
 
-    data_root: str
     is_astropt3_streaming: bool = True
-    match_index: Optional[str] = None
-    norm_stats: Optional[str] = None
-    # synthetic stream controls (data_root == "synthetic")
-    synthetic_image_only_fraction: float = 0.3
-    synthetic_spectrum_only_fraction: float = 0.0
-    # append one object_id line per trained object to {path}.dp{rank} —
-    # the no-replay audit trail for kill/resume verification
-    object_id_log: Optional[str] = None
-    # Emit each downloaded record this many times, each under a different
-    # ADR 0008 span order. The corpus is transfer-bound, so extra
-    # factorisations of a record already in memory cost GPU, not bytes.
-    # 1 is the historical behaviour. ADR 0014 §7a additionally refuses
-    # replicas that would repeat an order (one-span records get none).
     ar_replicas: int = 1
-    # ADR 0014 §7b. "decorrelated" (default) puts a base object's replicas in
-    # different packed rows, since document masking stops cross-attention but
-    # not gradient repetition inside a batch. "adjacent" is the pre-§7b
-    # behaviour, kept only so the B1 benchmark arm reproduces the measured
-    # result on the same footing.
     replica_placement: str = "decorrelated"
