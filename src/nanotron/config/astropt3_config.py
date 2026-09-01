@@ -16,15 +16,15 @@ through id 63 before explicitly enlarging ``vocab_size``; there is no text
 vocabulary and no lm_head.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 from nanotron.config.models_config import Qwen2Config
 
 # Pinned to the verified MMU pilot schemas (images (3,152,152) patch 8;
 # DESI spectra 7781 bins patch 256; ADR 0008 one-token scalar spans with
-# GMM heads under both tokenisers). Must stay in sync with the HF-side
-# DEFAULT_MODALITIES in astropt3/configuration_astropt3.py.
+# GMM heads). Must stay in sync with the HF-side DEFAULT_MODALITIES in
+# astropt3/configuration_astropt3.py.
 DEFAULT_MODALITIES = [
     {
         "name": "images",
@@ -107,12 +107,10 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    tokeniser: str = field(default="affine")  # affine, aim, or jetformer
-    huber_delta: float = 1.0
     loss_aggregation: str = "legacy_modality_mean"
     vocab_size: int = 64
     tie_word_embeddings: bool = False
-    # jetformer tokeniser (mirrors the HF-side AstroPT3Config defaults):
+    # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
     # per-modality TinyFlow1D + GMMHead, loss = mean(NLL_GMM(z) - logdet).
     # noise_max -> noise_min is the flow-stability curriculum, annealed by the
     # trainer via set_jet_noise_frac(iteration / train_steps).
@@ -122,7 +120,7 @@ class AstroPT3Config(Qwen2Config):
     jetformer_noise_max: float = 0.1
     jetformer_noise_min: float = 0.0
     # ADR 0008 scalar modalities: mixture count of the scalar GMM heads
-    # (used under BOTH tokenisers; carried into converted HF checkpoints)
+    # (carried into converted HF checkpoints)
     scalar_gmm_k: int = 5
     # arcsinh divisor (nMgy) of the physical image normalization; threaded
     # into the sequencer by astro's build_astropt3_dataloader and carried
@@ -201,8 +199,6 @@ class AstroPT3Config(Qwen2Config):
             raise ValueError(f"vocab_size={self.vocab_size} cannot hold modality token id {required_vocab - 1}")
         if self.tie_word_embeddings:
             raise ValueError("astropt3 has no lm_head to tie")
-        if self.tokeniser not in ("affine", "aim", "jetformer"):
-            raise ValueError(f"unknown tokeniser {self.tokeniser!r}")
         if self.loss_aggregation not in ("legacy_modality_mean", "family"):
             raise ValueError(f"unknown loss_aggregation {self.loss_aggregation!r}")
         names = [modality["name"] for modality in completed]

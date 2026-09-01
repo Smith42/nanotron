@@ -13,7 +13,7 @@ Weight-name contract (modeled on examples/smollm3):
   encoders.{m}.*         model.token_position_embeddings.pp_block.encoders.{m}.*
   pos_embeds.{m}.*       model.token_position_embeddings.pp_block.pos_embeds.{m}.*
   decoders.{m}.*         model.modality_head.pp_block.decoders.{m}.*
-  flows.{m}.*            model.token_position_embeddings.pp_block.flows.{m}.*  (jetformer)
+  flows.{m}.*            model.token_position_embeddings.pp_block.flows.{m}.*
   model.norm.weight      model.final_layer_norm.pp_block.weight
   =====================  =====================================================
 
@@ -41,7 +41,7 @@ from nanotron.serialize import load_weights
 from nanotron.trainer import mark_tied_parameters
 
 # HF-side parameter prefix -> nanotron parameter prefix, applied to the
-# modality modules whatever their inner structure (affine or aim tokeniser).
+# modality modules.
 _MODALITY_PREFIX_MAP = {
     "encoders.": "model.token_position_embeddings.pp_block.encoders.",
     "pos_embeds.": "model.token_position_embeddings.pp_block.pos_embeds.",
@@ -68,27 +68,19 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
         hf_to_nt_map[f"{hf_prefix}.input_layernorm.weight"] = f"{nt_prefix}.input_layernorm.weight"
         hf_to_nt_map[f"{hf_prefix}.post_attention_layernorm.weight"] = f"{nt_prefix}.post_attention_layernorm.weight"
 
-    # modality modules: generate from the tokeniser structure so affine, aim
-    # and jetformer all map (weights only; all implementations use bias=False)
-    if config.tokeniser == "jetformer":
-        encoder_weights, decoder_weights = ["c_fc.weight"], ["proj.weight"]
-    elif config.tokeniser == "affine":
-        encoder_weights = decoder_weights = ["c_fc.weight"]
-    else:  # aim
-        encoder_weights = decoder_weights = ["c_fc.weight", "c_proj.weight"]
+    # modality modules: every modality has an Encoder (c_fc.weight) and a
+    # GMMHead decoder (proj.weight); patch modalities additionally have a
+    # flow (weights only; all implementations use bias=False)
     for mod in config.modalities or ():
         name = mod["name"]
-        # ADR 0008 scalars: GMMHead (proj.weight) under every tokeniser, no flow
         scalar = mod.get("scalar", False)
-        for w in encoder_weights:
-            hf_to_nt_map[f"encoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.{w}"
-        for w in ["proj.weight"] if scalar else decoder_weights:
-            hf_to_nt_map[f"decoders.{name}.{w}"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.{w}"
+        hf_to_nt_map[f"encoders.{name}.c_fc.weight"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.c_fc.weight"
+        hf_to_nt_map[f"decoders.{name}.proj.weight"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.proj.weight"
         hf_to_nt_map[f"pos_embeds.{name}.embed.weight"] = f"{_MODALITY_PREFIX_MAP['pos_embeds.']}{name}.embed.weight"
-        if config.tokeniser == "jetformer" and not scalar:
+        if not scalar:
             # HF flows.{m}.blocks.{i}.net.{0,2}.{weight,bias} <-> fork
             # ...token_position_embeddings.pp_block.flows.{m}... (CouplingMLP
-            # nets carry biases, unlike the affine modality layers)
+            # nets carry biases, unlike the modality encoder/decoder layers)
             for i in range(config.jetformer_flow_steps):
                 for layer in (0, 2):
                     for p in ("weight", "bias"):
@@ -123,7 +115,6 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "eos_token_id": "eos_token_id",
         "hidden_act": "hidden_act",
         "hidden_size": "hidden_size",
-        "huber_delta": "huber_delta",
         "image_norm_divisor": "image_norm_divisor",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
@@ -146,7 +137,6 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "spectra_norm_divisor": "spectra_norm_divisor",
         "spiral": "spiral",
         "tie_word_embeddings": "tie_word_embeddings",
-        "tokeniser": "tokeniser",
         "vocab_size": "vocab_size",
     }
     if nt_to_hf:
