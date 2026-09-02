@@ -542,7 +542,7 @@ class AstroPT3Model(nn.Module):
                 "random_states": random_states,
             },
             module_input_keys={"input_ids", "position_ids", "modality_values", "modality_positions", "modality_masks"},
-            module_output_keys={"input_embeds", "position_ids"} | jet_keys,
+            module_output_keys={"input_embeds", "position_ids"} | self.jet_keys,
         )
 
         self.decoder = nn.ModuleList(
