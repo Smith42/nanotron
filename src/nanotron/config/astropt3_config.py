@@ -225,3 +225,8 @@ class AstroPT3StreamingDatasetsArgs:
     is_astropt3_streaming: bool = True
     ar_replicas: int = 1
     replica_placement: str = "decorrelated"
+    # ADR 0015 spectra experiment: stream a DESI-left crossmatch
+    # (mmu_desi_edr_sv3 x mmu_ssl_legacysurvey_north) instead of the plain
+    # uncrossmatched LegacySurvey catalog. Requires an active desi-source
+    # modality (e.g. "spectra").
+    crossmatch_desi: bool = False
