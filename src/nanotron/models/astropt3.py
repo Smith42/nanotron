@@ -14,7 +14,7 @@ the upstream Qwen2 pipeline graph:
   astroPT's ``starts-1`` alignment) plus :class:`AstroPT3Loss` (the family-
   balanced mean of per-modality ``NLL_GMM(z) - logdet`` losses).
 
-Parallelism contract (see astro/PLAN.md):
+Parallelism contract (see astro/EXPERIMENTS.md Part I):
 
 - **PP=1 always** (asserted): the whole micro-batch dict reaches every rank,
   so dict-valued inputs pass through PipelineBlocks locally and modality
@@ -453,6 +453,7 @@ class AstroPT3Loss(nn.Module):
         **predictions: torch.Tensor,  # {name}_pred + {name}_z / {name}_logdet
     ) -> Dict[str, torch.Tensor]:
         graph_zero = None
+        reference_loss = None
         losses_by_family = {"image": [], "spectrum": [], "scalar": []}
         legacy_terms = []
         out = {}
@@ -489,7 +490,12 @@ class AstroPT3Loss(nn.Module):
                 # absent from THIS batch still has to report a key; it stays
                 # out of the weighted total, and 0.0 reads as "no targets"
                 # against the per-modality losses beside it
-                out[f"{family}_family_loss"] = torch.zeros_like(reference_loss)
+                placeholder = (
+                    torch.zeros_like(reference_loss)
+                    if reference_loss is not None
+                    else torch.zeros(())
+                )
+                out[f"{family}_family_loss"] = placeholder
                 continue
             family_loss = torch.stack(losses).mean()
             out[f"{family}_family_loss"] = family_loss
@@ -741,7 +747,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
         random_states: Optional[RandomStates] = None,
     ):
         super().__init__()
-        assert parallel_context.pp_pg.size() == 1, "astropt3 is PP=1 by design (see astro/PLAN.md)"
+        assert parallel_context.pp_pg.size() == 1, "astropt3 is PP=1 by design (see astro/EXPERIMENTS.md Part I)"
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         assert tp_mode is TensorParallelLinearMode.ALL_REDUCE, (
             "astropt3 keeps modality encoders/decoders replicated across TP, which requires the "
