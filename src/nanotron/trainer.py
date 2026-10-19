@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
@@ -137,6 +138,8 @@ class DistributedTrainer:
         config_class: Type[Config] = Config,
         model_config_class: Optional[Type] = None,
         model_class: Type[NanotronModel] = None,
+        *,
+        benchmark: bool = False,
     ):
         """
         Nanotron's distributed trainer.
@@ -146,9 +149,11 @@ class DistributedTrainer:
             config_class: The `Config` class to use.
             model_config_class: The `ModelConfig` class to use (for example `LlamaConfig`). Defaults to `None` which will use the model config class defined in the config.
             model_class: The `NanotronModel` class to use (for example `LlamaForTraining`). Defaults to `None` which will use the model class defined in the config.
+            benchmark: Disable WandB initialization and logging for a benchmark run.
         """
 
         super().__init__()
+        self.benchmark = benchmark
         # Get config
         if isinstance(config_or_config_file, str):
             # Get the yaml config file
@@ -350,7 +355,7 @@ class DistributedTrainer:
         current_time = datetime.datetime.now().strftime("%d/%m/%Y_%H:%M:%S")
 
         # Initialize wandb for each TP group if TP > 1, but only for dp=0 ranks
-        if wandb is not None:
+        if not self.benchmark and wandb is not None:
             tp_size = self.parallel_context.tp_pg.size()
             dp_cp_rank = dist.get_rank(self.parallel_context.dp_cp_pg)
             tp_rank = dist.get_rank(self.parallel_context.tp_pg)
@@ -523,8 +528,21 @@ class DistributedTrainer:
         dataloader_or_dls: Dict[
             str, Union[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]], Tuple[Iterator, ...]]
         ],
+        *,
+        max_steps: Optional[int] = None,
         **kwargs,
     ) -> None:
+        """Train at most ``max_steps`` additional optimizer steps, without changing the YAML horizon."""
+        self.initial_iter_step = self.metadata.last_train_step + 1
+        self.last_iter_step = self.config.tokens.train_steps
+        if max_steps is not None:
+            if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
+                raise ValueError("max_steps must be a positive integer")
+            remaining_steps = self.last_iter_step - self.metadata.last_train_step
+            if max_steps > remaining_steps:
+                raise ValueError(f"max_steps={max_steps} exceeds the remaining training horizon ({remaining_steps})")
+            self.last_iter_step = self.metadata.last_train_step + max_steps
+
         if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
             self.save_checkpoint()
 
@@ -541,15 +559,26 @@ class DistributedTrainer:
         # Fix the root_model
         self.unwrapped_model.module_id_to_prefix[id(self.unwrapped_model)] = ""
 
-        self.initial_iter_step = self.metadata.last_train_step + 1
-        self.last_iter_step = self.config.tokens.train_steps
         self.pre_training(**kwargs)
+
+        astropt3_telemetry = None
+        if os.environ.get("ASTROPT3_TELEMETRY_DIR"):
+            try:
+                from astropt3.data import telemetry as astropt3_telemetry
+            except ImportError:
+                pass
 
         prof = get_profiler(config=self.config)
         # free memory
         gc.collect()
         torch.cuda.empty_cache()
+        self.telemetry_started_at = previous_boundary = 0.0
         with prof:
+            if astropt3_telemetry is not None:
+                torch.cuda.synchronize()
+                dist.barrier(self.parallel_context.world_pg)
+                self.telemetry_started_at = time.perf_counter()
+                previous_boundary = self.telemetry_started_at
             for self.iteration_step in range(self.initial_iter_step, self.last_iter_step + 1):
                 if isinstance(prof, torch.profiler.profile):
                     logger.info(f"Profiler on for step {self.iteration_step}")
@@ -607,12 +636,42 @@ class DistributedTrainer:
                     }
                 assert self.metadata.current_stage.sequence_length == self.sequence_length, "Sequence length mismatch between the current stage and the global sequence length"
 
+                self.iteration_timer.end()
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg, z_loss_avg=z_loss_avg, tbi_logs=tbi_logs)
 
                 # Checkpoint
                 if self._should_checkpoint():
                     self.save_checkpoint()
+
+                if astropt3_telemetry is not None:
+                    # Include the full iteration and wait for the slowest rank at every boundary.
+                    torch.cuda.synchronize()
+                    dist.barrier(self.parallel_context.world_pg)
+                    now = time.perf_counter()
+                    step_record = astropt3_telemetry.drain_step()
+                    report = {}
+                    if not self.benchmark and hasattr(self.unwrapped_model, "get_mfu_report"):
+                        report = self.unwrapped_model.get_mfu_report(
+                            iteration_time_in_sec=now - previous_boundary,
+                            sequence_length=self.sequence_length,
+                            global_batch_size=self.global_batch_size,
+                            telemetry=step_record,
+                        )
+                    astropt3_telemetry.write_step(
+                        self.iteration_step,
+                        {
+                            **step_record,
+                            **report,
+                            "step_seconds": now - previous_boundary,
+                            "elapsed_s": now - self.telemetry_started_at,
+                            "dp_rank": dist.get_rank(self.parallel_context.dp_pg),
+                            "tp_rank": dist.get_rank(self.parallel_context.tp_pg),
+                            "world_size": self.parallel_context.world_pg.size(),
+                        },
+                        rank=dist.get_rank(self.parallel_context.world_pg),
+                    )
+                    previous_boundary = now
 
         dist.barrier()  # let's wait for everyone before leaving
 
@@ -767,8 +826,7 @@ class DistributedTrainer:
     ) -> None:
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
         dist.barrier()
-        # End the iteration timer and get elapsed time in milliseconds
-        self.iteration_timer.end()
+        # The iteration timer is ended on every step, independently of logging cadence.
         elapsed_time_per_iteration_ms = self.iteration_timer.elapsed * 1000
         tokens_per_sec = (
             self.global_batch_size * self.sequence_length / (elapsed_time_per_iteration_ms / 1000)
@@ -804,38 +862,6 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
-        # astropt3 (ADR 0014 §2a/§3): drain the loader telemetry for this step
-        # and log MFU DECOMPOSED. Headline MFU is refused as an acceptance
-        # criterion (§11) because it is gameable by duplication and padding
-        # and confounds pipeline with model-shape effects — so the three
-        # factors always travel together, alongside the per-modality token
-        # composition (§4) that says what the step actually trained on.
-        if hasattr(self.unwrapped_model, "get_mfu_report"):
-            try:
-                from astropt3.data import telemetry as astropt3_telemetry
-            except ImportError:
-                astropt3_telemetry = None
-            if astropt3_telemetry is not None and astropt3_telemetry.telemetry_dir():
-                step_record = astropt3_telemetry.drain_step()
-                report = self.unwrapped_model.get_mfu_report(
-                    iteration_time_in_sec=elapsed_time_per_iteration_ms / 1000,
-                    sequence_length=self.sequence_length,
-                    global_batch_size=self.global_batch_size,
-                    telemetry=step_record,
-                )
-                for key, value in report.items():
-                    basic_log_entries.append(LogItem(key, value, "human_format"))
-                total_loss_tokens = sum(step_record.get("loss_tokens", {}).values())
-                for name, count in sorted(step_record.get("loss_tokens", {}).items()):
-                    basic_log_entries.append(
-                        LogItem(f"composition/{name}", count / max(total_loss_tokens, 1), "human_format")
-                    )
-                astropt3_telemetry.write_step(
-                    self.iteration_step,
-                    {**step_record, **report},
-                    rank=dp_cp_rank,
-                )
-
         # astropt3: surface per-modality losses (rank-local like z_loss —
         # not DP-synced, logging only). The model emits {name}_loss for every
         # modality on every micro-batch (0.0 when absent from the batch).
@@ -957,7 +983,7 @@ class DistributedTrainer:
                     )
 
         # WandB logging - determine if this rank should log to wandb
-        should_log_to_wandb = wandb is not None and (
+        should_log_to_wandb = not self.benchmark and wandb is not None and (
             (tp_size > 1 and dp_cp_rank == 0 and self.metrics_logging.log_level > 0)
             or (tp_size > 1 and world_rank == self.logger_ranks[0] and self.metrics_logging.log_level == 0)
             or (tp_size == 1 and world_rank == self.logger_ranks[0])  # For TP>1, log from each TP group's dp=0 rank
@@ -1308,6 +1334,8 @@ class DistributedTrainer:
 
     def _should_checkpoint(self) -> bool:
         interval = self.config.checkpoints.checkpoint_interval
+        if interval <= 0:
+            return False
         if getattr(self.config.checkpoints, "checkpoint_schedule", None) == "pythia":
             # canonical schedule lives in the astropt3 package (CPU-testable)
             from astropt3.checkpoint_schedule import should_checkpoint
