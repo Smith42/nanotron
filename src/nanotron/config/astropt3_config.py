@@ -223,8 +223,14 @@ class AstroPT3StreamingDatasetsArgs:
     """
 
     is_astropt3_streaming: bool = True
+    # Total optimizer-step exposures per batch from each loaded draw.
+    echo_factor: int = 1
     # ADR 0015 spectra experiment: stream a DESI-left crossmatch
     # (mmu_desi_edr_sv3 x mmu_ssl_legacysurvey_north) instead of the plain
     # uncrossmatched LegacySurvey catalog. Requires an active desi-source
     # modality (e.g. "spectra").
     crossmatch_desi: bool = False
+
+    def __post_init__(self):
+        if type(self.echo_factor) is not int or self.echo_factor < 1:
+            raise ValueError("echo_factor must be a positive integer")

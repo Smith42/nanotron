@@ -311,6 +311,8 @@ def get_dataloader_from_data_stage(
             dp_size=trainer.parallel_context.dp_pg.size(),
             num_workers=data.num_loading_workers or 0,
             seed=data.seed or 0,
+            batch_accumulation_per_replica=trainer.n_micro_batches_per_batch,
+            world_size=trainer.parallel_context.world_pg.size(),
         )
 
     else:
