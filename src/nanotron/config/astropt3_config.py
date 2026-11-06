@@ -215,22 +215,19 @@ class AstroPT3Config(Qwen2Config):
 
 @dataclass
 class AstroPT3StreamingDatasetsArgs:
-    """LSDB ``InfiniteStream`` dataset type (ADR 0015).
+    """Explicit YAML-configured LSDB catalog streams.
 
-    The catalog and stream policy are fixed in ``astropt3``. DataLoader
-    workers provide concurrency; consumers deliberately have no ownership or
-    resumable cursor.
+    ``catalog_stream`` is required. Validation/decoding lives in ``astropt3``.
+    DataLoader workers provide concurrency, without a resumable stream cursor.
     """
 
     is_astropt3_streaming: bool = True
     # Total optimizer-step exposures per batch from each loaded draw.
     echo_factor: int = 1
-    # ADR 0015 spectra experiment: stream a DESI-left crossmatch
-    # (mmu_desi_edr_sv3 x mmu_ssl_legacysurvey_north) instead of the plain
-    # uncrossmatched LegacySurvey catalog. Requires an active desi-source
-    # modality (e.g. "spectra").
-    crossmatch_desi: bool = False
+    catalog_stream: Optional[dict] = None
 
     def __post_init__(self):
         if type(self.echo_factor) is not int or self.echo_factor < 1:
             raise ValueError("echo_factor must be a positive integer")
+        if not isinstance(self.catalog_stream, dict) or not self.catalog_stream.get("catalogs"):
+            raise ValueError("catalog_stream.catalogs is required; migrate legacy dataset YAML")
