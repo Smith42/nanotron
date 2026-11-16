@@ -83,7 +83,14 @@ def convert_hf_to_nt(
 
 
 def get_nanotron_config(config: HFAstroPT3Config) -> NanotronAstroPT3Config:
-    attrs = {key: getattr(config, value) for key, value in get_config_mapping(nt_to_hf=True).items()}
+    # Transformers 5 stores RoPE settings in rope_parameters instead of top-level attributes.
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = config.rope_parameters["rope_theta"]
+    attrs = {
+        key: rope_theta if value == "rope_theta" else getattr(config, value)
+        for key, value in get_config_mapping(nt_to_hf=True).items()
+    }
     # training-machine attention path (the non-packed path is not maintained)
     attrs["_attn_implementation"] = "flash_attention_2"
     attrs["_use_qkv_packed"] = True
