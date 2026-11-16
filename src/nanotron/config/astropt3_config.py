@@ -111,11 +111,13 @@ class AstroPT3Config(Qwen2Config):
     vocab_size: int = 64
     tie_word_embeddings: bool = False
     # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
-    # per-modality TinyFlow1D + GMMHead, loss = mean(NLL_GMM(z) - logdet).
+    # per-modality JetFormerFlow + GMMHead, loss = mean(NLL_GMM(z) - logdet).
     # noise_max -> noise_min is the flow-stability curriculum, annealed by the
     # trainer via set_jet_noise_frac(iteration / train_steps).
-    jetformer_flow_steps: int = 4
+    jetformer_flow_steps: int = 8
     jetformer_flow_hidden: int = 128
+    jetformer_flow_depth: int = 4
+    jetformer_flow_heads: int = 8
     jetformer_gmm_k: int = 4
     jetformer_noise_max: float = 0.1
     jetformer_noise_min: float = 0.0
@@ -146,6 +148,12 @@ class AstroPT3Config(Qwen2Config):
         self.no_rope_layer = None
         super().__post_init__()
         self.no_rope_layer = no_rope_layer
+        for field in ("jetformer_flow_steps", "jetformer_flow_hidden", "jetformer_flow_depth", "jetformer_flow_heads"):
+            value = getattr(self, field)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{field} must be a positive integer")
+        if self.jetformer_flow_hidden % self.jetformer_flow_heads:
+            raise ValueError("jetformer_flow_hidden must be divisible by jetformer_flow_heads")
         raw_modalities = (
             [dict(modality) for modality in DEFAULT_MODALITIES] if self.modalities is None else self.modalities
         )
@@ -180,6 +188,19 @@ class AstroPT3Config(Qwen2Config):
             if modality["family"] not in ("image", "spectrum", "scalar"):
                 raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
             modality["scalar"] = modality["family"] == "scalar"
+            dim = modality.get("input_size")
+            if type(dim) is not int or dim < 1:
+                raise ValueError(f"modality {modality['name']!r} input_size must be a positive integer")
+            if not modality["scalar"]:
+                if dim % 2:
+                    raise ValueError(f"modality {modality['name']!r} flow requires an even input_size, got {dim}")
+                pos_type = modality.get("pos_type", "index")
+                if pos_type not in ("index", "continuous"):
+                    raise ValueError(f"unknown pos_type {pos_type!r}")
+                for field, default in (("max_positions", 1024), ("pos_input_size", 1)):
+                    value = modality.get(field, default)
+                    if type(value) is not int or value < 1:
+                        raise ValueError(f"modality {modality['name']!r} {field} must be a positive integer")
             # ADR 0014 §8 image factorisation; mirrors the HF-side
             # ModalityConfig defaults so a fused config need not name them.
             # The heavy validation lives there — this side only has to carry
