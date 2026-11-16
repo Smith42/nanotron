@@ -37,7 +37,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["image"],
         "token_ids": [2, 3, 4],
-        "loss_weight": 1.0,
     },
     {
         "name": "spectra",
@@ -50,7 +49,6 @@ DEFAULT_MODALITIES = [
         "source": "desi",
         "record_keys": ["spectrum"],
         "token_ids": [5, 6, 7],
-        "loss_weight": 1.0,
     },
     {
         "name": "Z",
@@ -63,7 +61,6 @@ DEFAULT_MODALITIES = [
         "source": "desi",
         "record_keys": ["Z"],
         "token_ids": [8, 9, 10],
-        "loss_weight": 0.1,
     },
     {
         "name": "ebv",
@@ -76,7 +73,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["ebv"],
         "token_ids": [11, 12, 13],
-        "loss_weight": 0.1,
     },
     {
         "name": "photometry",
@@ -89,7 +85,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["flux_g", "flux_r", "flux_z"],
         "token_ids": [14, 15, 16],
-        "loss_weight": 0.1,
     },
 ]
 
@@ -104,7 +99,6 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    loss_aggregation: str = "legacy_modality_mean"
     vocab_size: int = 64
     tie_word_embeddings: bool = False
     # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
@@ -214,8 +208,6 @@ class AstroPT3Config(Qwen2Config):
             raise ValueError(f"vocab_size={self.vocab_size} cannot hold modality token id {required_vocab - 1}")
         if self.tie_word_embeddings:
             raise ValueError("astropt3 has no lm_head to tie")
-        if self.loss_aggregation not in ("legacy_modality_mean", "family"):
-            raise ValueError(f"unknown loss_aggregation {self.loss_aggregation!r}")
         names = [modality["name"] for modality in completed]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate modality names: {names}")

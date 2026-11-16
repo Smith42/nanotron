@@ -412,13 +412,11 @@ class AstroPT3Loss(nn.Module):
 
     def __init__(self, config: AstroPT3Config):
         super().__init__()
-        self.loss_aggregation = config.loss_aggregation
         self.gmm_k = config.jetformer_gmm_k
         self.scalar_gmm_k = config.scalar_gmm_k
         self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
-        self.loss_weights = {name: config.modality(name).get("loss_weight", 1.0) for name in config.modality_names()}
 
     def forward(
         self,
@@ -428,7 +426,6 @@ class AstroPT3Loss(nn.Module):
         graph_zero = None
         reference_loss = None
         losses_by_family = {"image": [], "spectrum": [], "scalar": []}
-        legacy_terms = []
         out = {}
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
@@ -448,7 +445,6 @@ class AstroPT3Loss(nn.Module):
                 mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
             if present:
                 losses_by_family[self.modality_families[name]].append(mod_loss)
-                legacy_terms.append(self.loss_weights[name] * mod_loss)
             else:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
@@ -477,13 +473,7 @@ class AstroPT3Loss(nn.Module):
             weight_sum += family_weights[family]
         if total is None:
             raise ValueError("AstroPT3 loss received no modality predictions")
-        if self.loss_aggregation == "family":
-            out["loss"] = total / weight_sum if weight_sum else total
-        else:
-            legacy_total = torch.stack(legacy_terms).sum() if legacy_terms else total
-            if graph_zero is not None:
-                legacy_total = legacy_total + graph_zero
-            out["loss"] = legacy_total / max(len(legacy_terms), 1)
+        out["loss"] = total / weight_sum if weight_sum else total
         return out
 
 

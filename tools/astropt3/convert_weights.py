@@ -127,7 +127,6 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "image_norm_divisor": "image_norm_divisor",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
-        "loss_aggregation": "loss_aggregation",
         "jetformer_flow_steps": "jetformer_flow_steps",
         "jetformer_flow_hidden": "jetformer_flow_hidden",
         "jetformer_flow_depth": "jetformer_flow_depth",
