@@ -211,7 +211,7 @@ class AstroPT3Embedding(nn.Module):
         )
         # ADR 0008: scalar modalities never flow — raw normalized value is
         # both the embedded input and the GMM target (mirrors the HF side)
-        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         from astropt3.flows import JetFormerFlow
 
         self.flows = nn.ModuleDict()
@@ -298,7 +298,7 @@ class AstroPT3ModalityHead(nn.Module):
         scalar_names = {
             name
             for name in config.modality_names()
-            if config.modality(name).get("scalar", False)
+            if config.modality(name)["family"] == "scalar"
         }
         decoders = {}
         for name in config.modality_names():
@@ -372,7 +372,7 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
     for name in config.modality_names():
         modality = config.modality(name)
         width = modality["input_size"]
-        scalar = modality.get("scalar", False)
+        scalar = modality["family"] == "scalar"
 
         flops = 2 * width * hidden  # Encoder: one Linear
 
@@ -415,7 +415,7 @@ class AstroPT3Loss(nn.Module):
         self.loss_aggregation = config.loss_aggregation
         self.gmm_k = config.jetformer_gmm_k
         self.scalar_gmm_k = config.scalar_gmm_k
-        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
         self.loss_weights = {name: config.modality(name).get("loss_weight", 1.0) for name in config.modality_names()}
@@ -508,7 +508,7 @@ class AstroPT3Model(nn.Module):
         # and {m}_logdet [n] for the loss (PP=1 is asserted, so these dict
         # outputs pass through the PipelineBlock locally). Scalar modalities
         # emit no z/logdet — they bypass the flow.
-        patch_names = [name for name in config.modality_names() if not config.modality(name).get("scalar", False)]
+        patch_names = [name for name in config.modality_names() if config.modality(name)["family"] != "scalar"]
         self.jet_keys = {f"{name}_z" for name in patch_names} | {f"{name}_logdet" for name in patch_names}
 
         self.token_position_embeddings = PipelineBlock(

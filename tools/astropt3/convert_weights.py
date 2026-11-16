@@ -73,7 +73,7 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
     # JetFormerFlow (its Linear/LayerNorm layers carry biases)
     for mod in config.modalities or ():
         name = mod["name"]
-        scalar = mod.get("scalar", False)
+        scalar = mod["family"] == "scalar"
         hf_to_nt_map[f"encoders.{name}.c_fc.weight"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.c_fc.weight"
         hf_to_nt_map[f"decoders.{name}.proj.weight"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.proj.weight"
         hf_to_nt_map[f"pos_embeds.{name}.embed.weight"] = f"{_MODALITY_PREFIX_MAP['pos_embeds.']}{name}.embed.weight"

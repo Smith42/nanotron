@@ -64,7 +64,6 @@ DEFAULT_MODALITIES = [
         "record_keys": ["Z"],
         "token_ids": [8, 9, 10],
         "loss_weight": 0.1,
-        "scalar": True,
     },
     {
         "name": "ebv",
@@ -78,7 +77,6 @@ DEFAULT_MODALITIES = [
         "record_keys": ["ebv"],
         "token_ids": [11, 12, 13],
         "loss_weight": 0.1,
-        "scalar": True,
     },
     {
         "name": "photometry",
@@ -92,7 +90,6 @@ DEFAULT_MODALITIES = [
         "record_keys": ["flux_g", "flux_r", "flux_z"],
         "token_ids": [14, 15, 16],
         "loss_weight": 0.1,
-        "scalar": True,
     },
 ]
 
@@ -134,9 +131,7 @@ class AstroPT3Config(Qwen2Config):
     spectra_norm_divisor: float = 10.0
     # center-outward spiral image patch order (ADR 0004); threaded into the
     # sequencer like image_norm_divisor and carried into converted HF
-    # checkpoints. Default True matching the HF-side AstroPT3Config (the
-    # agreed going-forward default); raster checkpoints must set
-    # spiral: false explicitly.
+    # checkpoints (mirrors the HF-side default).
     spiral: bool = True
 
     def __post_init__(self):
@@ -187,11 +182,10 @@ class AstroPT3Config(Qwen2Config):
                 raise ValueError(f"modality {modality['name']!r} token_ids collide at {sorted(overlap)}")
             if modality["family"] not in ("image", "spectrum", "scalar"):
                 raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
-            modality["scalar"] = modality["family"] == "scalar"
             dim = modality.get("input_size")
             if type(dim) is not int or dim < 1:
                 raise ValueError(f"modality {modality['name']!r} input_size must be a positive integer")
-            if not modality["scalar"]:
+            if modality["family"] != "scalar":
                 if dim % 2:
                     raise ValueError(f"modality {modality['name']!r} flow requires an even input_size, got {dim}")
                 pos_type = modality.get("pos_type", "index")
