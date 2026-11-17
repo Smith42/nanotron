@@ -138,6 +138,18 @@ class GMMHead(nn.Module):
         return self.proj(h)
 
 
+class CategoricalHead(nn.Module):
+    """Embedding space -> class logits for a categorical scalar (HF twin:
+    ``astropt3.modalities.CategoricalHead``). Replicated across TP."""
+
+    def __init__(self, hidden_size: int, categories: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, categories, bias=False)
+
+    def forward(self, h):
+        return self.proj(h)
+
+
 def unpack_gmm_params(pred: torch.Tensor, k: int, d: int):
     """[n, K*(1+2D)] raw projection -> (logits_pi, mu, log_sigma); mirrors the
     HF GMMHead.forward reshape and log-sigma clamp exactly."""
@@ -306,7 +318,12 @@ class AstroPT3ModalityHead(nn.Module):
             # ADR 0008 scalars are GMM-headed directly, over the same k as
             # every other modality's GMMHead.
             k = config.scalar_gmm_k if name in scalar_names else config.jetformer_gmm_k
-            decoders[name] = GMMHead(config.hidden_size, input_size, k)
+            categories = config.modality(name).get("categories", 0)
+            decoders[name] = (
+                CategoricalHead(config.hidden_size, categories)
+                if categories
+                else GMMHead(config.hidden_size, input_size, k)
+            )
         self.decoders = nn.ModuleDict(decoders)
 
     def forward(
@@ -379,7 +396,9 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
         if modality.get("pos_type", "index") == "continuous":
             flops += 2 * modality.get("pos_input_size", 1) * hidden
 
-        if scalar:
+        if modality.get("categories", 0):
+            flops += 2 * hidden * modality["categories"]
+        elif scalar:
             k = config.scalar_gmm_k
             flops += 2 * hidden * k * (1 + 2 * width)
         else:
@@ -417,6 +436,9 @@ class AstroPT3Loss(nn.Module):
         self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
+        self.categorical_names = {
+            name for name in config.modality_names() if config.modality(name).get("categories", 0)
+        }
 
     def forward(
         self,
@@ -432,6 +454,9 @@ class AstroPT3Loss(nn.Module):
             present = pred.shape[0] > 0
             if not present:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
+            elif name in self.categorical_names:
+                # one-hot target -> class index; cross-entropy (HF twin mirrors this)
+                mod_loss = F.cross_entropy(pred.float(), modality_values[name].argmax(dim=-1))
             elif name in self.scalar_names:
                 # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
                 # no logdet
