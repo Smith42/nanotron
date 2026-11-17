@@ -70,24 +70,33 @@ def get_weight_mapping(config: NanotronAstroPT3Config, nt_to_hf: bool = True) ->
 
     # modality modules: every modality has an Encoder (c_fc.weight) and a
     # GMMHead decoder (proj.weight); patch modalities additionally have a
-    # flow (weights only; all implementations use bias=False)
+    # JetFormerFlow (its Linear/LayerNorm layers carry biases)
     for mod in config.modalities or ():
         name = mod["name"]
-        scalar = mod.get("scalar", False)
+        scalar = mod["family"] == "scalar"
         hf_to_nt_map[f"encoders.{name}.c_fc.weight"] = f"{_MODALITY_PREFIX_MAP['encoders.']}{name}.c_fc.weight"
         hf_to_nt_map[f"decoders.{name}.proj.weight"] = f"{_MODALITY_PREFIX_MAP['decoders.']}{name}.proj.weight"
         hf_to_nt_map[f"pos_embeds.{name}.embed.weight"] = f"{_MODALITY_PREFIX_MAP['pos_embeds.']}{name}.embed.weight"
         if not scalar:
-            # HF flows.{m}.blocks.{i}.net.{0,2}.{weight,bias} <-> fork
-            # ...token_position_embeddings.pp_block.flows.{m}... (CouplingMLP
-            # nets carry biases, unlike the modality encoder/decoder layers)
-            for i in range(config.jetformer_flow_steps):
-                for layer in (0, 2):
-                    for p in ("weight", "bias"):
-                        hf_key = f"flows.{name}.blocks.{i}.net.{layer}.{p}"
-                        hf_to_nt_map[hf_key] = (
-                            f"model.token_position_embeddings.pp_block.flows.{name}.blocks.{i}.net.{layer}.{p}"
-                        )
+            from astropt3.flows import JetFormerFlow
+
+            # Only names are needed, so build the flow on meta: flows can outweigh small backbones.
+            with torch.device("meta"):
+                flow = JetFormerFlow(
+                    mod["input_size"],
+                    steps=config.jetformer_flow_steps,
+                    hidden_dim=config.jetformer_flow_hidden,
+                    depth=config.jetformer_flow_depth,
+                    num_heads=config.jetformer_flow_heads,
+                    pos_type=mod.get("pos_type", "index"),
+                    max_positions=mod.get("max_positions", 1024),
+                    pos_input_size=mod.get("pos_input_size", 1),
+                )
+            # Permutations are deterministic nonpersistent buffers, not checkpoint parameters.
+            for suffix, _ in flow.named_parameters():
+                hf_to_nt_map[f"flows.{name}.{suffix}"] = (
+                    f"model.token_position_embeddings.pp_block.flows.{name}.{suffix}"
+                )
 
     if nt_to_hf:
         nt_to_hf_map = {}
@@ -118,9 +127,10 @@ def get_config_mapping(nt_to_hf: bool = True) -> dict:
         "image_norm_divisor": "image_norm_divisor",
         "initializer_range": "initializer_range",
         "intermediate_size": "intermediate_size",
-        "loss_aggregation": "loss_aggregation",
         "jetformer_flow_steps": "jetformer_flow_steps",
         "jetformer_flow_hidden": "jetformer_flow_hidden",
+        "jetformer_flow_depth": "jetformer_flow_depth",
+        "jetformer_flow_heads": "jetformer_flow_heads",
         "jetformer_gmm_k": "jetformer_gmm_k",
         "jetformer_noise_max": "jetformer_noise_max",
         "jetformer_noise_min": "jetformer_noise_min",

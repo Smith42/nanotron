@@ -37,7 +37,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["image"],
         "token_ids": [2, 3, 4],
-        "loss_weight": 1.0,
     },
     {
         "name": "spectra",
@@ -50,7 +49,6 @@ DEFAULT_MODALITIES = [
         "source": "desi",
         "record_keys": ["spectrum"],
         "token_ids": [5, 6, 7],
-        "loss_weight": 1.0,
     },
     {
         "name": "Z",
@@ -63,8 +61,6 @@ DEFAULT_MODALITIES = [
         "source": "desi",
         "record_keys": ["Z"],
         "token_ids": [8, 9, 10],
-        "loss_weight": 0.1,
-        "scalar": True,
     },
     {
         "name": "ebv",
@@ -77,8 +73,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["ebv"],
         "token_ids": [11, 12, 13],
-        "loss_weight": 0.1,
-        "scalar": True,
     },
     {
         "name": "photometry",
@@ -91,8 +85,6 @@ DEFAULT_MODALITIES = [
         "source": "legacy",
         "record_keys": ["flux_g", "flux_r", "flux_z"],
         "token_ids": [14, 15, 16],
-        "loss_weight": 0.1,
-        "scalar": True,
     },
 ]
 
@@ -107,15 +99,16 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    loss_aggregation: str = "legacy_modality_mean"
     vocab_size: int = 64
     tie_word_embeddings: bool = False
     # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
-    # per-modality TinyFlow1D + GMMHead, loss = mean(NLL_GMM(z) - logdet).
+    # per-modality JetFormerFlow + GMMHead, loss = mean(NLL_GMM(z) - logdet).
     # noise_max -> noise_min is the flow-stability curriculum, annealed by the
     # trainer via set_jet_noise_frac(iteration / train_steps).
-    jetformer_flow_steps: int = 4
+    jetformer_flow_steps: int = 8
     jetformer_flow_hidden: int = 128
+    jetformer_flow_depth: int = 4
+    jetformer_flow_heads: int = 8
     jetformer_gmm_k: int = 4
     jetformer_noise_max: float = 0.1
     jetformer_noise_min: float = 0.0
@@ -132,9 +125,7 @@ class AstroPT3Config(Qwen2Config):
     spectra_norm_divisor: float = 10.0
     # center-outward spiral image patch order (ADR 0004); threaded into the
     # sequencer like image_norm_divisor and carried into converted HF
-    # checkpoints. Default True matching the HF-side AstroPT3Config (the
-    # agreed going-forward default); raster checkpoints must set
-    # spiral: false explicitly.
+    # checkpoints (mirrors the HF-side default).
     spiral: bool = True
 
     def __post_init__(self):
@@ -146,6 +137,12 @@ class AstroPT3Config(Qwen2Config):
         self.no_rope_layer = None
         super().__post_init__()
         self.no_rope_layer = no_rope_layer
+        for field in ("jetformer_flow_steps", "jetformer_flow_hidden", "jetformer_flow_depth", "jetformer_flow_heads"):
+            value = getattr(self, field)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{field} must be a positive integer")
+        if self.jetformer_flow_hidden % self.jetformer_flow_heads:
+            raise ValueError("jetformer_flow_hidden must be divisible by jetformer_flow_heads")
         raw_modalities = (
             [dict(modality) for modality in DEFAULT_MODALITIES] if self.modalities is None else self.modalities
         )
@@ -179,7 +176,19 @@ class AstroPT3Config(Qwen2Config):
                 raise ValueError(f"modality {modality['name']!r} token_ids collide at {sorted(overlap)}")
             if modality["family"] not in ("image", "spectrum", "scalar"):
                 raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
-            modality["scalar"] = modality["family"] == "scalar"
+            dim = modality.get("input_size")
+            if type(dim) is not int or dim < 1:
+                raise ValueError(f"modality {modality['name']!r} input_size must be a positive integer")
+            if modality["family"] != "scalar":
+                if dim % 2:
+                    raise ValueError(f"modality {modality['name']!r} flow requires an even input_size, got {dim}")
+                pos_type = modality.get("pos_type", "index")
+                if pos_type not in ("index", "continuous"):
+                    raise ValueError(f"unknown pos_type {pos_type!r}")
+                for field, default in (("max_positions", 1024), ("pos_input_size", 1)):
+                    value = modality.get(field, default)
+                    if type(value) is not int or value < 1:
+                        raise ValueError(f"modality {modality['name']!r} {field} must be a positive integer")
             # ADR 0014 §8 image factorisation; mirrors the HF-side
             # ModalityConfig defaults so a fused config need not name them.
             # The heavy validation lives there — this side only has to carry
@@ -199,8 +208,6 @@ class AstroPT3Config(Qwen2Config):
             raise ValueError(f"vocab_size={self.vocab_size} cannot hold modality token id {required_vocab - 1}")
         if self.tie_word_embeddings:
             raise ValueError("astropt3 has no lm_head to tie")
-        if self.loss_aggregation not in ("legacy_modality_mean", "family"):
-            raise ValueError(f"unknown loss_aggregation {self.loss_aggregation!r}")
         names = [modality["name"] for modality in completed]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate modality names: {names}")
@@ -215,22 +222,19 @@ class AstroPT3Config(Qwen2Config):
 
 @dataclass
 class AstroPT3StreamingDatasetsArgs:
-    """LSDB ``InfiniteStream`` dataset type (ADR 0015).
+    """Explicit YAML-configured LSDB catalog streams.
 
-    The catalog and stream policy are fixed in ``astropt3``. DataLoader
-    workers provide concurrency; consumers deliberately have no ownership or
-    resumable cursor.
+    ``catalog_stream`` is required. Validation/decoding lives in ``astropt3``.
+    DataLoader workers provide concurrency, without a resumable stream cursor.
     """
 
     is_astropt3_streaming: bool = True
     # Total optimizer-step exposures per batch from each loaded draw.
     echo_factor: int = 1
-    # ADR 0015 spectra experiment: stream a DESI-left crossmatch
-    # (mmu_desi_edr_sv3 x mmu_ssl_legacysurvey_north) instead of the plain
-    # uncrossmatched LegacySurvey catalog. Requires an active desi-source
-    # modality (e.g. "spectra").
-    crossmatch_desi: bool = False
+    catalog_stream: Optional[dict] = None
 
     def __post_init__(self):
         if type(self.echo_factor) is not int or self.echo_factor < 1:
             raise ValueError("echo_factor must be a positive integer")
+        if not isinstance(self.catalog_stream, dict) or not self.catalog_stream.get("catalogs"):
+            raise ValueError("catalog_stream.catalogs is required; migrate legacy dataset YAML")

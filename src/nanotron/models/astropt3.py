@@ -120,53 +120,6 @@ class PositionEmbedder(nn.Module):
 # (may be negative).
 
 
-class CouplingMLP(nn.Module):
-    """RealNVP-style affine coupling over the feature dim of one token."""
-
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.split = dim // 2
-        self.net = nn.Sequential(
-            nn.Linear(self.split, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2 * (dim - self.split)),
-        )
-
-    def forward(self, x, reverse: bool = False, flip: bool = False):
-        x1 = x[..., : self.split]
-        x2 = x[..., self.split :]
-        ident, moved = (x2, x1) if flip else (x1, x2)
-        s, t = self.net(ident).chunk(2, dim=-1)
-        s = torch.tanh(s) * 1.5  # bound the scale for numerical stability
-        if not reverse:
-            moved = moved * torch.exp(s) + t
-            logdet = s.sum(dim=-1)
-        else:
-            moved = (moved - t) * torch.exp(-s)
-            logdet = -s.sum(dim=-1)
-        halves = [moved, ident] if flip else [ident, moved]
-        return torch.cat(halves, dim=-1), logdet
-
-
-class TinyFlow1D(nn.Module):
-    """Stack of affine couplings over (..., D) patch tokens. Replicated across TP."""
-
-    def __init__(self, dim: int, steps: int = 4, hidden_dim: int = 128):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError(f"TinyFlow1D requires an even token dim, got {dim}")
-        self.blocks = nn.ModuleList(CouplingMLP(dim, hidden_dim) for _ in range(steps))
-
-    def forward(self, x, reverse: bool = False):
-        logdet = x.new_zeros(x.shape[:-1])
-        indexed = list(enumerate(self.blocks))
-        z = x
-        for i, block in reversed(indexed) if reverse else indexed:
-            z, ld = block(z, reverse=reverse, flip=(i % 2 == 1))
-            logdet = logdet + ld
-        return z, logdet
-
-
 class GMMHead(nn.Module):
     """Embedding space -> raw GMM projection. Replicated across TP.
 
@@ -258,18 +211,24 @@ class AstroPT3Embedding(nn.Module):
         )
         # ADR 0008: scalar modalities never flow — raw normalized value is
         # both the embedded input and the GMM target (mirrors the HF side)
-        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
-        self.flows = nn.ModuleDict(
-            {
-                name: TinyFlow1D(
-                    config.modality(name)["input_size"],
-                    steps=config.jetformer_flow_steps,
-                    hidden_dim=config.jetformer_flow_hidden,
-                )
-                for name in config.modality_names()
-                if name not in self.scalar_names
-            }
-        )
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
+        from astropt3.flows import JetFormerFlow
+
+        self.flows = nn.ModuleDict()
+        for name in config.modality_names():
+            if name in self.scalar_names:
+                continue
+            modality = config.modality(name)
+            self.flows[name] = JetFormerFlow(
+                modality["input_size"],
+                steps=config.jetformer_flow_steps,
+                hidden_dim=config.jetformer_flow_hidden,
+                depth=config.jetformer_flow_depth,
+                num_heads=config.jetformer_flow_heads,
+                pos_type=modality.get("pos_type", "index"),
+                max_positions=modality.get("max_positions", 1024),
+                pos_input_size=modality.get("pos_input_size", 1),
+            )
         # Noise curriculum (HF twin: AstroPT3Model.set_jet_noise_frac):
         # sigma = noise_max + (noise_min - noise_max) * frac anneals
         # noise_max -> noise_min as frac goes 0 -> 1; the trainer drives
@@ -299,7 +258,11 @@ class AstroPT3Embedding(nn.Module):
         for name, encoder in self.encoders.items():
             values = modality_values[name].to(input_embeds.dtype)
             if name not in self.scalar_names:
-                z, logdet = self.flows[name](values)
+                from astropt3.flows import flow_object_ids
+
+                z, logdet = self.flows[name](
+                    values, modality_positions[name], flow_object_ids(position_ids, modality_masks[name])
+                )
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
                 sigma = (
@@ -319,7 +282,10 @@ class AstroPT3Embedding(nn.Module):
                     )
                     with random_state:
                         values = z + sigma * torch.randn_like(z)
-            content = encoder(values) + self.pos_embeds[name](modality_positions[name]).to(input_embeds.dtype)
+            # The affine flow may return fp32; only the embedded copy is cast, never the loss target.
+            content = encoder(values.to(input_embeds.dtype)) + self.pos_embeds[name](modality_positions[name]).to(
+                input_embeds.dtype
+            )
             delta = delta.index_put((modality_masks[name].view(-1),), content.to(input_embeds.dtype))
         return {"input_embeds": input_embeds + delta, "position_ids": position_ids, **extras}
 
@@ -332,7 +298,7 @@ class AstroPT3ModalityHead(nn.Module):
         scalar_names = {
             name
             for name in config.modality_names()
-            if config.modality(name).get("scalar", False)
+            if config.modality(name)["family"] == "scalar"
         }
         decoders = {}
         for name in config.modality_names():
@@ -394,8 +360,8 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
 
     Priced against the modules in this file: :class:`Encoder`,
     :class:`PositionEmbedder`, :class:`GMMHead`, and, for patch modalities,
-    :class:`TinyFlow1D`. A linear layer costs ``2 * in * out``; an index
-    position embedding is a lookup and costs nothing.
+    ``astropt3.flows.JetFormerFlow``. A linear layer costs ``2 * in * out``;
+    an index position embedding is a lookup and costs nothing.
 
     ADR 0014 §3 requires this to be recomputed per model config — per-band
     changes both the token count and the head width, so arms must never
@@ -406,7 +372,7 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
     for name in config.modality_names():
         modality = config.modality(name)
         width = modality["input_size"]
-        scalar = modality.get("scalar", False)
+        scalar = modality["family"] == "scalar"
 
         flops = 2 * width * hidden  # Encoder: one Linear
 
@@ -419,11 +385,18 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
         else:
             k = config.jetformer_gmm_k
             flops += 2 * hidden * k * (1 + 2 * width)
-            # TinyFlow1D: per coupling block, Linear(D/2 -> H) + Linear(H -> D)
-            hidden_dim = config.jetformer_flow_hidden
-            flops += config.jetformer_flow_steps * (
-                2 * (width // 2) * hidden_dim + 2 * hidden_dim * width
-            )
+            # JetFormerFlow, per coupling: Linear(D/2 -> H) [+ continuous
+            # position Linear] + depth x (qkv 3H^2 + out H^2 + MLP 8H^2 linears,
+            # plus QK^T and AV over the span) + Linear(H -> D).
+            # shortcut: span length is max_positions (an upper bound; images use 144 of 361), so attention FLOPs
+            # are overstated; pass the real per-modality span length if MFU must be exact.
+            h = config.jetformer_flow_hidden
+            span = modality.get("max_positions", 1024)
+            coupling = 2 * (width // 2) * h + 2 * h * width
+            if modality.get("pos_type", "index") == "continuous":
+                coupling += 2 * modality.get("pos_input_size", 1) * h
+            coupling += config.jetformer_flow_depth * (2 * 12 * h * h + 4 * span * h)
+            flops += config.jetformer_flow_steps * coupling
 
         per_token[name] = float(flops)
     return per_token
@@ -439,13 +412,11 @@ class AstroPT3Loss(nn.Module):
 
     def __init__(self, config: AstroPT3Config):
         super().__init__()
-        self.loss_aggregation = config.loss_aggregation
         self.gmm_k = config.jetformer_gmm_k
         self.scalar_gmm_k = config.scalar_gmm_k
-        self.scalar_names = {name for name in config.modality_names() if config.modality(name).get("scalar", False)}
+        self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
-        self.loss_weights = {name: config.modality(name).get("loss_weight", 1.0) for name in config.modality_names()}
 
     def forward(
         self,
@@ -455,7 +426,6 @@ class AstroPT3Loss(nn.Module):
         graph_zero = None
         reference_loss = None
         losses_by_family = {"image": [], "spectrum": [], "scalar": []}
-        legacy_terms = []
         out = {}
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
@@ -475,7 +445,6 @@ class AstroPT3Loss(nn.Module):
                 mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
             if present:
                 losses_by_family[self.modality_families[name]].append(mod_loss)
-                legacy_terms.append(self.loss_weights[name] * mod_loss)
             else:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
@@ -504,13 +473,7 @@ class AstroPT3Loss(nn.Module):
             weight_sum += family_weights[family]
         if total is None:
             raise ValueError("AstroPT3 loss received no modality predictions")
-        if self.loss_aggregation == "family":
-            out["loss"] = total / weight_sum if weight_sum else total
-        else:
-            legacy_total = torch.stack(legacy_terms).sum() if legacy_terms else total
-            if graph_zero is not None:
-                legacy_total = legacy_total + graph_zero
-            out["loss"] = legacy_total / max(len(legacy_terms), 1)
+        out["loss"] = total / weight_sum if weight_sum else total
         return out
 
 
@@ -535,7 +498,7 @@ class AstroPT3Model(nn.Module):
         # and {m}_logdet [n] for the loss (PP=1 is asserted, so these dict
         # outputs pass through the PipelineBlock locally). Scalar modalities
         # emit no z/logdet — they bypass the flow.
-        patch_names = [name for name in config.modality_names() if not config.modality(name).get("scalar", False)]
+        patch_names = [name for name in config.modality_names() if config.modality(name)["family"] != "scalar"]
         self.jet_keys = {f"{name}_z" for name in patch_names} | {f"{name}_logdet" for name in patch_names}
 
         self.token_position_embeddings = PipelineBlock(
@@ -748,6 +711,8 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
     ):
         super().__init__()
         assert parallel_context.pp_pg.size() == 1, "astropt3 is PP=1 by design (see astro/EXPERIMENTS.md Part I)"
+        # The flow attends over each object's whole span, so a span must not be split across CP ranks.
+        assert parallel_context.cp_pg.size() == 1, "astropt3 jetformer flows require CP=1"
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         assert tp_mode is TensorParallelLinearMode.ALL_REDUCE, (
             "astropt3 keeps modality encoders/decoders replicated across TP, which requires the "
@@ -828,6 +793,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
         parametrizator.MODULE_TO_PARAMETRIZE[nn.Embedding] = parametrizator.MODULE_TO_PARAMETRIZE[
             TensorParallelEmbedding
         ]
+        parametrizator.MODULE_TO_PARAMETRIZE[nn.LayerNorm] = parametrizator.MODULE_TO_PARAMETRIZE[TritonRMSNorm]
 
         log_rank(
             f"Parametrizing model parameters using {parametrizator.__class__.__name__}",
@@ -875,6 +841,9 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             "Somehow the initialized set of parameters don't match:\n"
             f" - Expected: {expected_parameters}\n - Got: {initialized_parameters}"
         )
+        # Generic initialization overwrites identity couplings; checkpoint loads must not reset them.
+        for flow in self.model.token_position_embeddings.pp_block.flows.values():
+            flow.reset_coupling_outputs()
 
     def get_embeddings_lm_head_tied_names(self):
         return []  # no lm_head to tie

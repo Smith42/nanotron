@@ -303,7 +303,9 @@ def init_on_device_and_dtype(
             if should_ignore_init_on_device_and_dtype():
                 pass
             else:
-                module._buffers[name] = module._buffers[name].to(device, dtype)
+                # Index/permutation, bool and complex buffers must retain their dtype.
+                buffer_dtype = dtype if buffer.is_floating_point() else buffer.dtype
+                module._buffers[name] = buffer.to(device=device, dtype=buffer_dtype)
 
     # Patch tensor creation
     tensor_constructors_to_patch = {
