@@ -422,11 +422,14 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
 
 
 class AstroPT3Loss(nn.Module):
-    """ADR 0013 family-balanced modality loss, in fp32.
+    """Family-balanced modality loss, in fp32 (HF twin: AstroPT3Model.forward).
 
-    Present modalities are averaged within image/spectrum/scalar, then present
-    family means are combined at 1:1:0.1. Absent modalities still contribute
-    ``0 * pred.sum()`` to keep their decoders in the DDP graph.
+    Each family's loss is one mean over all of its tokens, so a modality counts
+    in proportion to its tokens in the batch; image and spectrum token NLLs are
+    first divided by ``input_size`` (nats per dimension). Present families
+    combine at image:spectrum:scalar 1:1:0.1. ``{name}_loss`` stays the raw
+    per-token mean. Absent modalities still contribute ``0 * pred.sum()`` to
+    keep their decoders in the DDP graph.
     """
 
     def __init__(self, config: AstroPT3Config):
@@ -447,30 +450,41 @@ class AstroPT3Loss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         graph_zero = None
         reference_loss = None
-        losses_by_family = {"image": [], "spectrum": [], "scalar": []}
+        family_sums, family_counts = {}, {}
         out = {}
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
             present = pred.shape[0] > 0
             if not present:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
-            elif name in self.categorical_names:
-                # one-hot target -> class index; cross-entropy (HF twin mirrors this)
-                mod_loss = F.cross_entropy(pred.float(), modality_values[name].argmax(dim=-1))
-            elif name in self.scalar_names:
-                # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
-                # no logdet
-                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
-                mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
             else:
-                # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
-                # negative); z/logdet come clean from the embedding block
-                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
-                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
-                mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
-            if present:
-                losses_by_family[self.modality_families[name]].append(mod_loss)
-            else:
+                if name in self.categorical_names:
+                    # one-hot target -> class index; cross-entropy (HF twin mirrors this)
+                    token_loss = F.cross_entropy(
+                        pred.float(), modality_values[name].argmax(dim=-1), reduction="none"
+                    )
+                elif name in self.scalar_names:
+                    # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
+                    # no logdet
+                    logits_pi, mu, log_sigma = unpack_gmm_params(
+                        pred.float(), self.scalar_gmm_k, self.modality_dims[name]
+                    )
+                    token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
+                else:
+                    # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
+                    # negative); z/logdet come clean from the embedding block
+                    logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
+                    nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
+                    token_loss = nll - predictions[f"{name}_logdet"].float()
+                mod_loss = token_loss.mean()
+                family = self.modality_families[name]
+                # patch tokens in nats per dimension; scalar tokens as they are
+                pooled = token_loss.sum()
+                if family != "scalar":
+                    pooled = pooled / self.modality_dims[name]
+                family_sums[family] = pooled if family not in family_sums else family_sums[family] + pooled
+                family_counts[family] = family_counts.get(family, 0) + token_loss.numel()
+            if not present:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
             reference_loss = mod_loss  # device/dtype for absent families
@@ -478,8 +492,8 @@ class AstroPT3Loss(nn.Module):
         total = graph_zero
         weight_sum = 0.0
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
-        for family, losses in losses_by_family.items():
-            if not losses:
+        for family in family_weights:
+            if family not in family_sums:
                 # PipelineBlock asserts an exact output-key set, so a family
                 # absent from THIS batch still has to report a key; it stays
                 # out of the weighted total, and 0.0 reads as "no targets"
@@ -491,7 +505,7 @@ class AstroPT3Loss(nn.Module):
                 )
                 out[f"{family}_family_loss"] = placeholder
                 continue
-            family_loss = torch.stack(losses).mean()
+            family_loss = family_sums[family] / family_counts[family]
             out[f"{family}_family_loss"] = family_loss
             weighted = family_weights[family] * family_loss
             total = weighted if total is None else total + weighted
