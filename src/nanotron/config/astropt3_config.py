@@ -102,7 +102,7 @@ class AstroPT3Config(Qwen2Config):
     vocab_size: int = 64
     tie_word_embeddings: bool = False
     # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
-    # per-modality JetFormerFlow + GMMHead, loss = mean(NLL_GMM(z) - logdet).
+    # Full-width JetFormerFlow + d_ar-wide GMMHead, with a standard-normal tail prior.
     # noise_max -> noise_min is the flow-stability curriculum, annealed by the
     # trainer via set_jet_noise_frac(iteration / train_steps).
     jetformer_flow_steps: int = 8
@@ -161,15 +161,9 @@ class AstroPT3Config(Qwen2Config):
             try:
                 token_ids = tuple(int(token_id) for token_id in modality["token_ids"])
             except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"modality {modality['name']!r} has invalid token_ids"
-                ) from error
-            if len(token_ids) != 3 or token_ids != tuple(
-                range(token_ids[0], token_ids[0] + 3)
-            ):
-                raise ValueError(
-                    f"modality {modality['name']!r} token_ids must be three consecutive ids"
-                )
+                raise ValueError(f"modality {modality['name']!r} has invalid token_ids") from error
+            if len(token_ids) != 3 or token_ids != tuple(range(token_ids[0], token_ids[0] + 3)):
+                raise ValueError(f"modality {modality['name']!r} token_ids must be three consecutive ids")
             modality["token_ids"] = list(token_ids)
             overlap = used_token_ids.intersection(token_ids)
             if overlap:
@@ -179,6 +173,14 @@ class AstroPT3Config(Qwen2Config):
             dim = modality.get("input_size")
             if type(dim) is not int or dim < 1:
                 raise ValueError(f"modality {modality['name']!r} input_size must be a positive integer")
+            d_ar = modality.get("d_ar")
+            if d_ar is None:
+                d_ar = dim
+            if type(d_ar) is not int or not 1 <= d_ar <= dim:
+                raise ValueError(f"modality {modality['name']!r} d_ar must be a positive integer <= input_size")
+            if modality["family"] == "scalar" and d_ar != dim:
+                raise ValueError(f"scalar modality {modality['name']!r} d_ar must equal input_size")
+            modality["d_ar"] = d_ar
             if modality["family"] != "scalar":
                 if dim % 2:
                     raise ValueError(f"modality {modality['name']!r} flow requires an even input_size, got {dim}")
