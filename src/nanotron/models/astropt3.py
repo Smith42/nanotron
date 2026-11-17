@@ -12,7 +12,7 @@ the upstream Qwen2 pipeline graph:
 - the ``lm_head`` + sharded-CE ``Loss`` blocks become :class:`AstroPT3ModalityHead`
   (per-modality GMM heads applied one position LEFT of each modality token —
   astroPT's ``starts-1`` alignment) plus :class:`AstroPT3Loss` (the family-
-  balanced mean of per-modality ``NLL_GMM(z) - logdet`` losses).
+  balanced mean of per-modality autoregressive + Gaussian prior - logdet losses).
 
 Parallelism contract (see astro/EXPERIMENTS.md Part I):
 
@@ -47,6 +47,8 @@ from contextlib import nullcontext
 from typing import Dict, Optional, Union, cast
 
 import torch
+from astropt3.flows import JetFormerFlow
+from astropt3.modalities import std_normal_nll
 from torch import nn
 from torch.nn import functional as F
 
@@ -116,7 +118,7 @@ class PositionEmbedder(nn.Module):
 # Duplicated from the HF-side astropt3.modalities with IDENTICAL attribute
 # names (blocks.{i}.net.{0,2}, proj) — they are part of the conversion
 # contract in tools/astropt3/convert_weights.py. Per-modality loss becomes
-# mean(NLL_GMM(z) - logdet): exact likelihood in standardized patch space
+# mean(NLL_GMM(z_ar) + NLL_Normal(z_tail) - logdet): exact likelihood in patch space
 # (may be negative).
 
 
@@ -201,10 +203,7 @@ class AstroPT3Embedding(nn.Module):
             mode=tp_mode,
         )
         self.encoders = nn.ModuleDict(
-            {
-                name: Encoder(config.hidden_size, config.modality(name)["input_size"])
-                for name in config.modality_names()
-            }
+            {name: Encoder(config.hidden_size, config.modality(name)["d_ar"]) for name in config.modality_names()}
         )
         self.pos_embeds = nn.ModuleDict(
             {name: PositionEmbedder(config.hidden_size, config.modality(name)) for name in config.modality_names()}
@@ -212,7 +211,6 @@ class AstroPT3Embedding(nn.Module):
         # ADR 0008: scalar modalities never flow — raw normalized value is
         # both the embedded input and the GMM target (mirrors the HF side)
         self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
-        from astropt3.flows import JetFormerFlow
 
         self.flows = nn.ModuleDict()
         for name in config.modality_names():
@@ -283,6 +281,7 @@ class AstroPT3Embedding(nn.Module):
                     with random_state:
                         values = z + sigma * torch.randn_like(z)
             # The affine flow may return fp32; only the embedded copy is cast, never the loss target.
+            values = values[..., : cast(Encoder, encoder).c_fc.in_features]
             content = encoder(values.to(input_embeds.dtype)) + self.pos_embeds[name](modality_positions[name]).to(
                 input_embeds.dtype
             )
@@ -302,11 +301,11 @@ class AstroPT3ModalityHead(nn.Module):
         }
         decoders = {}
         for name in config.modality_names():
-            input_size = config.modality(name)["input_size"]
+            d_ar = config.modality(name)["d_ar"]
             # ADR 0008 scalars are GMM-headed directly, over the same k as
             # every other modality's GMMHead.
             k = config.scalar_gmm_k if name in scalar_names else config.jetformer_gmm_k
-            decoders[name] = GMMHead(config.hidden_size, input_size, k)
+            decoders[name] = GMMHead(config.hidden_size, d_ar, k)
         self.decoders = nn.ModuleDict(decoders)
 
     def forward(
@@ -374,17 +373,18 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
         width = modality["input_size"]
         scalar = modality["family"] == "scalar"
 
-        flops = 2 * width * hidden  # Encoder: one Linear
+        d_ar = modality["d_ar"]
+        flops = 2 * d_ar * hidden  # Encoder: one Linear
 
         if modality.get("pos_type", "index") == "continuous":
             flops += 2 * modality.get("pos_input_size", 1) * hidden
 
         if scalar:
             k = config.scalar_gmm_k
-            flops += 2 * hidden * k * (1 + 2 * width)
+            flops += 2 * hidden * k * (1 + 2 * d_ar)
         else:
             k = config.jetformer_gmm_k
-            flops += 2 * hidden * k * (1 + 2 * width)
+            flops += 2 * hidden * k * (1 + 2 * d_ar)
             # JetFormerFlow, per coupling: Linear(D/2 -> H) [+ continuous
             # position Linear] + depth x (qkv 3H^2 + out H^2 + MLP 8H^2 linears,
             # plus QK^T and AV over the span) + Linear(H -> D).
@@ -415,7 +415,7 @@ class AstroPT3Loss(nn.Module):
         self.gmm_k = config.jetformer_gmm_k
         self.scalar_gmm_k = config.scalar_gmm_k
         self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
-        self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
+        self.modality_dims = {name: config.modality(name)["d_ar"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
 
     def forward(
@@ -438,11 +438,22 @@ class AstroPT3Loss(nn.Module):
                 logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
                 mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
             else:
-                # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
-                # negative); z/logdet come clean from the embedding block
-                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
-                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
-                mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
+                # Full patch likelihood: autoregressive prefix + Gaussian tail - logdet.
+                d_ar = self.modality_dims[name]
+                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, d_ar)
+                z = predictions[f"{name}_z"].float()
+                nll = gmm_nll(z[..., :d_ar], logits_pi, mu, log_sigma)
+                out[f"{name}_ar_loss"] = nll.mean()
+                prior = std_normal_nll(z[..., d_ar:]) if d_ar < z.shape[-1] else None
+                out[f"{name}_prior_loss"] = prior.mean() if prior is not None else nll.new_zeros(())
+                logdet = predictions[f"{name}_logdet"].float()
+                out[f"{name}_logdet_loss"] = logdet.mean()
+                if prior is not None:
+                    nll = nll + prior
+                mod_loss = (nll - logdet).mean()
+            if not present and name not in self.scalar_names:
+                for component in ("ar", "prior", "logdet"):
+                    out[f"{name}_{component}_loss"] = torch.zeros_like(mod_loss)
             if present:
                 losses_by_family[self.modality_families[name]].append(mod_loss)
             else:
@@ -595,7 +606,7 @@ class AstroPT3Model(nn.Module):
         model_config = self.config
         d_ff = model_config.intermediate_size
         d_qkv = model_config.hidden_size // model_config.num_attention_heads
-        head_cost = sum(2 * model_config.hidden_size * m["input_size"] for m in model_config.modalities or ())
+        head_cost = sum(2 * model_config.hidden_size * m["d_ar"] for m in model_config.modalities or ())
         return {
             Qwen2DecoderLayer: 4 * model_config.num_attention_heads * d_qkv * model_config.hidden_size
             + 3 * d_ff * model_config.hidden_size,
@@ -734,6 +745,12 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             | self.model.jet_keys,
             module_output_keys={"loss"}
             | {f"{name}_loss" for name in config.modality_names()}
+            | {
+                f"{name}_{component}_loss"
+                for name in config.modality_names()
+                if config.modality(name)["family"] != "scalar"
+                for component in ("ar", "prior", "logdet")
+            }
             # families are the fixed image/spectrum/scalar set (config validates
             # it), and the loss emits all three every batch to keep this static
             | {f"{family}_family_loss" for family in ("image", "spectrum", "scalar")},
@@ -842,8 +859,8 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             f" - Expected: {expected_parameters}\n - Got: {initialized_parameters}"
         )
         # Generic initialization overwrites identity couplings; checkpoint loads must not reset them.
-        for flow in self.model.token_position_embeddings.pp_block.flows.values():
-            flow.reset_coupling_outputs()
+        for flow in cast(AstroPT3Embedding, self.model.token_position_embeddings.pp_block).flows.values():
+            cast(JetFormerFlow, flow).reset_coupling_outputs()
 
     def get_embeddings_lm_head_tied_names(self):
         return []  # no lm_head to tie
