@@ -138,6 +138,18 @@ class GMMHead(nn.Module):
         return self.proj(h)
 
 
+class CategoricalHead(nn.Module):
+    """Embedding space -> class logits for a categorical scalar (HF twin:
+    ``astropt3.modalities.CategoricalHead``). Replicated across TP."""
+
+    def __init__(self, hidden_size: int, categories: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, categories, bias=False)
+
+    def forward(self, h):
+        return self.proj(h)
+
+
 def unpack_gmm_params(pred: torch.Tensor, k: int, d: int):
     """[n, K*(1+2D)] raw projection -> (logits_pi, mu, log_sigma); mirrors the
     HF GMMHead.forward reshape and log-sigma clamp exactly."""
@@ -229,17 +241,25 @@ class AstroPT3Embedding(nn.Module):
                 max_positions=modality.get("max_positions", 1024),
                 pos_input_size=modality.get("pos_input_size", 1),
             )
-        # Noise curriculum (HF twin: AstroPT3Model.set_jet_noise_frac):
-        # sigma = noise_max + (noise_min - noise_max) * frac anneals
-        # noise_max -> noise_min as frac goes 0 -> 1; the trainer drives
-        # frac each step. Noise hits only the embedded z copy in training
-        # mode — the emitted {m}_z target and {m}_logdet stay clean.
+        self.pre_flow_noise_max = {name: config.modality(name).get("pre_flow_noise_max", 0.0) for name in self.flows}
         self.jetformer_noise_max = config.jetformer_noise_max
         self.jetformer_noise_min = config.jetformer_noise_min
         self.jet_noise_frac = 1.0
 
     def set_jet_noise_frac(self, frac: float):
         self.jet_noise_frac = min(max(frac, 0.0), 1.0)
+
+    def _add_noise(self, values: torch.Tensor, sigma: float) -> torch.Tensor:
+        if not (sigma > 0 and values.numel()):
+            return values
+        # Identical draws keep the replicated hidden stream in sync across TP.
+        random_state = (
+            branch_random_state(self.random_states, "tp_synced", enabled=True)
+            if self.random_states is not None and "tp_synced" in self.random_states
+            else nullcontext()
+        )
+        with random_state:
+            return values + sigma * torch.randn_like(values)
 
     def forward(
         self,
@@ -249,39 +269,32 @@ class AstroPT3Embedding(nn.Module):
         modality_positions: Dict[str, torch.Tensor],  # name -> [n_m] or [n_m, pos_dim]
         modality_masks: Dict[str, torch.Tensor],  # name -> bool [batch_size, seq_length]
     ):
+        from astropt3.flows import flow_object_ids, pre_flow_noise_scale
+
         input_embeds = self.token_embedding(input_ids.view(-1))  # [b*s, hidden]
         delta = torch.zeros_like(input_embeds)
         extras = {}
+        pre_flow_scale = pre_flow_noise_scale(self.jet_noise_frac) if self.training else 0.0
+        latent_sigma = 0.0
+        if self.training:
+            latent_sigma = self.jetformer_noise_max + (
+                self.jetformer_noise_min - self.jetformer_noise_max
+            ) * self.jet_noise_frac
         # Always run every encoder (even on zero-length values): the empty
         # index_put keeps absent modalities in the autograd graph with zero
         # gradient, so DDP never sees unused parameters.
         for name, encoder in self.encoders.items():
-            values = modality_values[name].to(input_embeds.dtype)
+            values = modality_values[name]
             if name not in self.scalar_names:
-                from astropt3.flows import flow_object_ids
-
+                values = self._add_noise(values, self.pre_flow_noise_max[name] * pre_flow_scale)
                 z, logdet = self.flows[name](
-                    values, modality_positions[name], flow_object_ids(position_ids, modality_masks[name])
+                    values.to(input_embeds.dtype),
+                    modality_positions[name],
+                    flow_object_ids(position_ids, modality_masks[name]),
                 )
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
-                sigma = (
-                    self.jetformer_noise_max
-                    + (self.jetformer_noise_min - self.jetformer_noise_max) * self.jet_noise_frac
-                )
-                values = z
-                if self.training and sigma > 0:
-                    # the noise must be IDENTICAL across TP ranks or the
-                    # replicated-hidden-stream contract breaks — draw it under
-                    # the trainer's tp_synced random state
-                    random_state = (
-                        branch_random_state(self.random_states, "tp_synced", enabled=True)
-                        if self.random_states is not None
-                        and "tp_synced" in self.random_states
-                        else nullcontext()
-                    )
-                    with random_state:
-                        values = z + sigma * torch.randn_like(z)
+                values = self._add_noise(z, latent_sigma)
             # The affine flow may return fp32; only the embedded copy is cast, never the loss target.
             content = encoder(values.to(input_embeds.dtype)) + self.pos_embeds[name](modality_positions[name]).to(
                 input_embeds.dtype
@@ -306,7 +319,12 @@ class AstroPT3ModalityHead(nn.Module):
             # ADR 0008 scalars are GMM-headed directly, over the same k as
             # every other modality's GMMHead.
             k = config.scalar_gmm_k if name in scalar_names else config.jetformer_gmm_k
-            decoders[name] = GMMHead(config.hidden_size, input_size, k)
+            categories = config.modality(name).get("categories", 0)
+            decoders[name] = (
+                CategoricalHead(config.hidden_size, categories)
+                if categories
+                else GMMHead(config.hidden_size, input_size, k)
+            )
         self.decoders = nn.ModuleDict(decoders)
 
     def forward(
@@ -379,7 +397,9 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
         if modality.get("pos_type", "index") == "continuous":
             flops += 2 * modality.get("pos_input_size", 1) * hidden
 
-        if scalar:
+        if modality.get("categories", 0):
+            flops += 2 * hidden * modality["categories"]
+        elif scalar:
             k = config.scalar_gmm_k
             flops += 2 * hidden * k * (1 + 2 * width)
         else:
@@ -403,11 +423,14 @@ def modality_flops_per_token(config: AstroPT3Config) -> Dict[str, float]:
 
 
 class AstroPT3Loss(nn.Module):
-    """ADR 0013 family-balanced modality loss, in fp32.
+    """Family-balanced modality loss, in fp32 (HF twin: AstroPT3Model.forward).
 
-    Present modalities are averaged within image/spectrum/scalar, then present
-    family means are combined at 1:1:0.1. Absent modalities still contribute
-    ``0 * pred.sum()`` to keep their decoders in the DDP graph.
+    Each family's loss is one mean over all of its tokens, so a modality counts
+    in proportion to its tokens in the batch; image and spectrum token NLLs are
+    first divided by ``input_size`` (nats per dimension). Present families
+    combine at image:spectrum:scalar 1:1:0.1. ``{name}_loss`` stays the raw
+    per-token mean. Absent modalities still contribute ``0 * pred.sum()`` to
+    keep their decoders in the DDP graph.
     """
 
     def __init__(self, config: AstroPT3Config):
@@ -417,6 +440,9 @@ class AstroPT3Loss(nn.Module):
         self.scalar_names = {name for name in config.modality_names() if config.modality(name)["family"] == "scalar"}
         self.modality_dims = {name: config.modality(name)["input_size"] for name in config.modality_names()}
         self.modality_families = {name: config.modality(name)["family"] for name in config.modality_names()}
+        self.categorical_names = {
+            name for name in config.modality_names() if config.modality(name).get("categories", 0)
+        }
 
     def forward(
         self,
@@ -425,27 +451,41 @@ class AstroPT3Loss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         graph_zero = None
         reference_loss = None
-        losses_by_family = {"image": [], "spectrum": [], "scalar": []}
+        family_sums, family_counts = {}, {}
         out = {}
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
             present = pred.shape[0] > 0
             if not present:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
-            elif name in self.scalar_names:
-                # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
-                # no logdet
-                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
-                mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
             else:
-                # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
-                # negative); z/logdet come clean from the embedding block
-                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
-                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
-                mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
-            if present:
-                losses_by_family[self.modality_families[name]].append(mod_loss)
-            else:
+                if name in self.categorical_names:
+                    # one-hot target -> class index; cross-entropy (HF twin mirrors this)
+                    token_loss = F.cross_entropy(
+                        pred.float(), modality_values[name].argmax(dim=-1), reduction="none"
+                    )
+                elif name in self.scalar_names:
+                    # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
+                    # no logdet
+                    logits_pi, mu, log_sigma = unpack_gmm_params(
+                        pred.float(), self.scalar_gmm_k, self.modality_dims[name]
+                    )
+                    token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
+                else:
+                    # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
+                    # negative); z/logdet both come from the same flow pass
+                    logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
+                    nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
+                    token_loss = nll - predictions[f"{name}_logdet"].float()
+                mod_loss = token_loss.mean()
+                family = self.modality_families[name]
+                # patch tokens in nats per dimension; scalar tokens as they are
+                pooled = token_loss.sum()
+                if family != "scalar":
+                    pooled = pooled / self.modality_dims[name]
+                family_sums[family] = pooled if family not in family_sums else family_sums[family] + pooled
+                family_counts[family] = family_counts.get(family, 0) + token_loss.numel()
+            if not present:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
             out[f"{name}_loss"] = mod_loss
             reference_loss = mod_loss  # device/dtype for absent families
@@ -453,8 +493,8 @@ class AstroPT3Loss(nn.Module):
         total = graph_zero
         weight_sum = 0.0
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
-        for family, losses in losses_by_family.items():
-            if not losses:
+        for family in family_weights:
+            if family not in family_sums:
                 # PipelineBlock asserts an exact output-key set, so a family
                 # absent from THIS batch still has to report a key; it stays
                 # out of the weighted total, and 0.0 reads as "no targets"
@@ -466,7 +506,7 @@ class AstroPT3Loss(nn.Module):
                 )
                 out[f"{family}_family_loss"] = placeholder
                 continue
-            family_loss = torch.stack(losses).mean()
+            family_loss = family_sums[family] / family_counts[family]
             out[f"{family}_family_loss"] = family_loss
             weighted = family_weights[family] * family_loss
             total = weighted if total is None else total + weighted
