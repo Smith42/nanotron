@@ -3,7 +3,8 @@
 Two additions over Qwen2Config:
 
 - ``modalities``: list of per-modality dicts (name/input_size/patch_size,
-  position contract, family/source/record keys, token ids, legacy loss weight)
+  position contract, family/source/record keys, image band or format, token ids,
+  legacy loss weight)
   mirroring the HF-side
   ``astropt3.configuration_astropt3.DEFAULT_MODALITIES``. Registry order is
   alphabetical by name everywhere.
@@ -11,9 +12,8 @@ Two additions over Qwen2Config:
   consumed by ``run_train.py`` (packed multimodal micro-batches built by the
   ``astropt3`` package's ``data/nanotron_loader.py``).
 
-Existing token ids 0–16 are frozen. ADR 0013 configs consume reserved blocks
-through id 63 before explicitly enlarging ``vocab_size``; there is no text
-vocabulary and no lm_head.
+Named modalities own fixed three-id blocks. Configs must size ``vocab_size``
+to cover their active token ids; there is no text vocabulary and no lm_head.
 """
 
 from dataclasses import dataclass
@@ -21,23 +21,47 @@ from typing import List, Optional
 
 from nanotron.config.models_config import Qwen2Config
 
-# Pinned to the verified MMU pilot schemas (images (3,152,152) patch 8;
-# DESI spectra 7781 bins patch 256; ADR 0008 one-token scalar spans with
-# GMM heads). Must stay in sync with the HF-side DEFAULT_MODALITIES in
-# astropt3/configuration_astropt3.py.
+# Keep the fixed and reserved blocks in sync with astropt3/tokenization.py.
+_MODALITY_ID_BLOCKS = {
+    "spectra": 5,
+    "Z": 8,
+    "ebv": 11,
+    "photometry": 14,
+    "galaxies": 23,
+    "legacy_north_g": 160,
+    "legacy_north_r": 163,
+    "legacy_north_z": 166,
+    "legacy_south_g": 169,
+    "legacy_south_r": 172,
+    "legacy_south_i": 175,
+    "legacy_south_z": 178,
+    "hsc_g": 181,
+    "hsc_r": 184,
+    "hsc_i": 187,
+    "hsc_z": 190,
+    "hsc_y": 193,
+}
+_FIXED_TOKEN_IDS = {token_id for base in _MODALITY_ID_BLOCKS.values() for token_id in range(base, base + 3)}
+_RESERVED_TOKEN_IDS = {0, 1, *range(2, 5), *range(20, 23), *range(53, 56)}
+
+# Keep in sync with astropt3/configuration_astropt3.py.
 DEFAULT_MODALITIES = [
     {
-        "name": "images",
-        "input_size": 192,
+        "name": name,
+        "input_size": 64,
         "patch_size": 8,
         "pos_type": "index",
         "pos_input_size": 1,
-        "max_positions": 361,
+        "max_positions": 144,
         "family": "image",
-        "source": "legacy",
+        "source": "legacy_north",
         "record_keys": ["image"],
-        "token_ids": [2, 3, 4],
-    },
+        "band": f"des-{name.removeprefix('legacy_north_')}",
+        "token_ids": [base, base + 1, base + 2],
+    }
+    for name, base in _MODALITY_ID_BLOCKS.items()
+    if name.startswith("legacy_north_")
+] + [
     {
         "name": "spectra",
         "input_size": 256,
@@ -89,6 +113,33 @@ DEFAULT_MODALITIES = [
 ]
 
 
+def _validate_image_modality(modality: dict) -> None:
+    name = modality["name"]
+    image_format = modality.get("image_format", "physical")
+    if image_format == "rgb":
+        if modality.get("band") is not None:
+            raise ValueError(f"modality {name!r} RGB images do not support band")
+        channels = 3
+    elif image_format == "physical":
+        band = modality.get("band")
+        if not isinstance(band, str) or not band.strip() or band.startswith("rgb-"):
+            raise ValueError(f"modality {name!r} physical images must declare a calibrated band")
+        channels = 1
+    else:
+        raise ValueError(f"modality {name!r} has invalid image_format {image_format!r} (physical | rgb)")
+    keys = modality["record_keys"]
+    if not isinstance(keys, (list, tuple)) or len(keys) != 1 or not isinstance(keys[0], str) or not keys[0].strip():
+        raise ValueError(f"modality {name!r} image record_keys must contain exactly one nonempty key")
+    patch_size = modality.get("patch_size")
+    if type(patch_size) is not int or patch_size < 1:
+        raise ValueError(f"modality {name!r} patch_size must be a positive integer")
+    expected = channels * patch_size**2
+    if modality["input_size"] != expected:
+        raise ValueError(
+            f"modality {name!r} input_size must be {expected} for {image_format} images with patch_size={patch_size}"
+        )
+
+
 @dataclass
 class AstroPT3Config(Qwen2Config):
     """Qwen2/SmolLM3 body + per-modality regression heads (no lm_head).
@@ -99,7 +150,8 @@ class AstroPT3Config(Qwen2Config):
 
     is_astropt3_config: bool = True
     modalities: Optional[List[dict]] = None
-    vocab_size: int = 64
+    eos_token_id: int = 1
+    vocab_size: int = 169
     tie_word_embeddings: bool = False
     # jetformer regression head (mirrors the HF-side AstroPT3Config defaults):
     # per-modality JetFormerFlow + GMMHead, loss = mean(NLL_GMM(z) - logdet).
@@ -143,43 +195,52 @@ class AstroPT3Config(Qwen2Config):
                 raise ValueError(f"{field} must be a positive integer")
         if self.jetformer_flow_hidden % self.jetformer_flow_heads:
             raise ValueError("jetformer_flow_hidden must be divisible by jetformer_flow_heads")
-        raw_modalities = (
-            [dict(modality) for modality in DEFAULT_MODALITIES] if self.modalities is None else self.modalities
-        )
-        legacy = {modality["name"]: modality for modality in DEFAULT_MODALITIES}
+        raw_modalities = DEFAULT_MODALITIES if self.modalities is None else self.modalities
+        defaults_by_name = {modality["name"]: modality for modality in DEFAULT_MODALITIES}
         completed = []
-        used_token_ids = {0, 1}
+        used_token_ids = _RESERVED_TOKEN_IDS.copy()
         for raw in raw_modalities:
             modality = dict(raw)
-            defaults = legacy.get(modality.get("name"), {})
-            for key in ("family", "source", "record_keys", "token_ids"):
+            name = modality.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("modality name must be a nonempty string")
+            for key in ("channel_tokenization", "band_order"):
+                if key in modality:
+                    raise ValueError(f"modality {name!r} does not support {key}")
+            defaults = defaults_by_name.get(name, {})
+            for key in ("family", "source", "record_keys", "band"):
                 if key not in modality and key in defaults:
                     modality[key] = defaults[key]
+            base = _MODALITY_ID_BLOCKS.get(name)
+            fixed_ids = tuple(range(base, base + 3)) if base is not None else None
+            if fixed_ids is not None:
+                modality.setdefault("token_ids", fixed_ids)
             missing = [key for key in ("family", "source", "record_keys", "token_ids") if key not in modality]
             if missing:
-                raise ValueError(f"modality {modality.get('name')!r} is missing {', '.join(missing)}")
+                raise ValueError(f"modality {name!r} is missing {', '.join(missing)}")
             try:
                 token_ids = tuple(int(token_id) for token_id in modality["token_ids"])
             except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"modality {modality['name']!r} has invalid token_ids"
-                ) from error
-            if len(token_ids) != 3 or token_ids != tuple(
-                range(token_ids[0], token_ids[0] + 3)
-            ):
-                raise ValueError(
-                    f"modality {modality['name']!r} token_ids must be three consecutive ids"
-                )
+                raise ValueError(f"modality {name!r} has invalid token_ids") from error
+            if len(token_ids) != 3 or token_ids != tuple(range(token_ids[0], token_ids[0] + 3)):
+                raise ValueError(f"modality {name!r} token_ids must be three consecutive ids")
+            if fixed_ids is not None and token_ids != fixed_ids:
+                raise ValueError(f"modality {name!r} must use token_ids {fixed_ids}")
+            blocked_ids = used_token_ids if fixed_ids is not None else used_token_ids | _FIXED_TOKEN_IDS
+            if overlap := blocked_ids.intersection(token_ids):
+                raise ValueError(f"modality {name!r} token_ids collide at {sorted(overlap)}")
             modality["token_ids"] = list(token_ids)
-            overlap = used_token_ids.intersection(token_ids)
-            if overlap:
-                raise ValueError(f"modality {modality['name']!r} token_ids collide at {sorted(overlap)}")
-            if modality["family"] not in ("image", "spectrum", "scalar"):
-                raise ValueError(f"modality {modality['name']!r} has invalid family {modality['family']!r}")
+            family = modality["family"]
+            if family not in ("image", "spectrum", "scalar"):
+                raise ValueError(f"modality {name!r} has invalid family {family!r}")
             dim = modality.get("input_size")
             if type(dim) is not int or dim < 1:
-                raise ValueError(f"modality {modality['name']!r} input_size must be a positive integer")
-            if modality["family"] != "scalar":
+                raise ValueError(f"modality {name!r} input_size must be a positive integer")
+            if family == "image":
+                _validate_image_modality(modality)
+            elif modality.get("band") is not None or modality.get("image_format", "physical") != "physical":
+                raise ValueError(f"modality {name!r} band and image_format are only supported for images")
+            if family != "scalar":
                 if dim % 2:
                     raise ValueError(f"modality {modality['name']!r} flow requires an even input_size, got {dim}")
                 pos_type = modality.get("pos_type", "index")
@@ -189,17 +250,6 @@ class AstroPT3Config(Qwen2Config):
                     value = modality.get(field, default)
                     if type(value) is not int or value < 1:
                         raise ValueError(f"modality {modality['name']!r} {field} must be a positive integer")
-            # ADR 0014 §8 image factorisation; mirrors the HF-side
-            # ModalityConfig defaults so a fused config need not name them.
-            # The heavy validation lives there — this side only has to carry
-            # the fields into the sequencer and the resume fingerprint.
-            modality.setdefault("channel_tokenization", "fused")
-            modality.setdefault("band_order", [])
-            if modality["channel_tokenization"] not in ("fused", "per_band"):
-                raise ValueError(
-                    f"modality {modality['name']!r} has invalid channel_tokenization "
-                    f"{modality['channel_tokenization']!r} (fused | per_band)"
-                )
             used_token_ids.update(token_ids)
             completed.append(modality)
         self.modalities = completed
