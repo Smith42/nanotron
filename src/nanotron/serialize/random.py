@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import numpy as np
 import torch
+from numpy.core.multiarray import _reconstruct
 
 from nanotron import distributed as dist
 from nanotron.parallel import ParallelContext
-from nanotron.random import RandomStates
+from nanotron.random import RandomState, RandomStates
 
 
 def save_random_states(
@@ -32,7 +34,7 @@ def load_random_states(parallel_context: ParallelContext, root_folder: Path):
         / f"tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_dp-{dist.get_rank(parallel_context.dp_pg)}-of-{parallel_context.dp_pg.size()}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}.pt"
     )
 
-    # TODO @thomasw21: That's annothing but this actually uses pickle, we might need to change that for something else
-    state = torch.load(filename)
-
-    return state
+    with torch.serialization.safe_globals([
+        RandomState, RandomStates, np.ndarray, np.dtype, type(np.dtype(np.uint32)), _reconstruct,
+    ]):
+        return torch.load(filename, map_location="cpu", weights_only=True)

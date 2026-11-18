@@ -96,6 +96,7 @@ from nanotron.scaling.parametrization import ParametrizationMethod
 from nanotron.serialize import (
     load_lr_scheduler,
     load_meta,
+    load_random_states,
     load_weights,
     parse_ckpt_path,
     save,
@@ -244,10 +245,22 @@ class DistributedTrainer:
             )
 
         # Define iteration start state
+        self.rng_restored = False
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_lr_scheduler:
             checkpoint_metadata = load_meta(
                 parallel_context=self.parallel_context, root_folder=self.init_checkpoint_path
             )
+            if isinstance(self.unwrapped_model, AstroPT3ForTraining):
+                if (checkpoint_metadata.tp, checkpoint_metadata.dp) == (
+                    self.parallel_context.tp_pg.size(), self.parallel_context.dp_pg.size(),
+                ):
+                    restored = load_random_states(self.parallel_context, self.init_checkpoint_path)
+                    # The model already holds a reference to this mapping.
+                    self.random_states.update(restored)
+                    self.rng_restored = True
+                else:
+                    log_rank("Training topology changed; starting a fresh noise sequence", logger=logger,
+                             level=logging.WARNING, rank=0)
             assert isinstance(checkpoint_metadata.metas, TrainingMetadata)
             log_rank(str(checkpoint_metadata), logger=logger, level=logging.INFO, rank=0)
             self.metadata: TrainingMetadata = checkpoint_metadata.metas
