@@ -241,17 +241,25 @@ class AstroPT3Embedding(nn.Module):
                 max_positions=modality.get("max_positions", 1024),
                 pos_input_size=modality.get("pos_input_size", 1),
             )
-        # Noise curriculum (HF twin: AstroPT3Model.set_jet_noise_frac):
-        # sigma = noise_max + (noise_min - noise_max) * frac anneals
-        # noise_max -> noise_min as frac goes 0 -> 1; the trainer drives
-        # frac each step. Noise hits only the embedded z copy in training
-        # mode — the emitted {m}_z target and {m}_logdet stay clean.
+        self.pre_flow_noise_max = {name: config.modality(name).get("pre_flow_noise_max", 0.0) for name in self.flows}
         self.jetformer_noise_max = config.jetformer_noise_max
         self.jetformer_noise_min = config.jetformer_noise_min
         self.jet_noise_frac = 1.0
 
     def set_jet_noise_frac(self, frac: float):
         self.jet_noise_frac = min(max(frac, 0.0), 1.0)
+
+    def _add_noise(self, values: torch.Tensor, sigma: float) -> torch.Tensor:
+        if not (sigma > 0 and values.numel()):
+            return values
+        # Identical draws keep the replicated hidden stream in sync across TP.
+        random_state = (
+            branch_random_state(self.random_states, "tp_synced", enabled=True)
+            if self.random_states is not None and "tp_synced" in self.random_states
+            else nullcontext()
+        )
+        with random_state:
+            return values + sigma * torch.randn_like(values)
 
     def forward(
         self,
@@ -261,39 +269,32 @@ class AstroPT3Embedding(nn.Module):
         modality_positions: Dict[str, torch.Tensor],  # name -> [n_m] or [n_m, pos_dim]
         modality_masks: Dict[str, torch.Tensor],  # name -> bool [batch_size, seq_length]
     ):
+        from astropt3.flows import flow_object_ids, pre_flow_noise_scale
+
         input_embeds = self.token_embedding(input_ids.view(-1))  # [b*s, hidden]
         delta = torch.zeros_like(input_embeds)
         extras = {}
+        pre_flow_scale = pre_flow_noise_scale(self.jet_noise_frac) if self.training else 0.0
+        latent_sigma = 0.0
+        if self.training:
+            latent_sigma = self.jetformer_noise_max + (
+                self.jetformer_noise_min - self.jetformer_noise_max
+            ) * self.jet_noise_frac
         # Always run every encoder (even on zero-length values): the empty
         # index_put keeps absent modalities in the autograd graph with zero
         # gradient, so DDP never sees unused parameters.
         for name, encoder in self.encoders.items():
-            values = modality_values[name].to(input_embeds.dtype)
+            values = modality_values[name]
             if name not in self.scalar_names:
-                from astropt3.flows import flow_object_ids
-
+                values = self._add_noise(values, self.pre_flow_noise_max[name] * pre_flow_scale)
                 z, logdet = self.flows[name](
-                    values, modality_positions[name], flow_object_ids(position_ids, modality_masks[name])
+                    values.to(input_embeds.dtype),
+                    modality_positions[name],
+                    flow_object_ids(position_ids, modality_masks[name]),
                 )
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
-                sigma = (
-                    self.jetformer_noise_max
-                    + (self.jetformer_noise_min - self.jetformer_noise_max) * self.jet_noise_frac
-                )
-                values = z
-                if self.training and sigma > 0:
-                    # the noise must be IDENTICAL across TP ranks or the
-                    # replicated-hidden-stream contract breaks — draw it under
-                    # the trainer's tp_synced random state
-                    random_state = (
-                        branch_random_state(self.random_states, "tp_synced", enabled=True)
-                        if self.random_states is not None
-                        and "tp_synced" in self.random_states
-                        else nullcontext()
-                    )
-                    with random_state:
-                        values = z + sigma * torch.randn_like(z)
+                values = self._add_noise(z, latent_sigma)
             # The affine flow may return fp32; only the embedded copy is cast, never the loss target.
             content = encoder(values.to(input_embeds.dtype)) + self.pos_embeds[name](modality_positions[name]).to(
                 input_embeds.dtype
@@ -472,7 +473,7 @@ class AstroPT3Loss(nn.Module):
                     token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
                 else:
                     # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
-                    # negative); z/logdet come clean from the embedding block
+                    # negative); z/logdet both come from the same flow pass
                     logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
                     nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
                     token_loss = nll - predictions[f"{name}_logdet"].float()
