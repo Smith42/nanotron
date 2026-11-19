@@ -52,6 +52,7 @@ from torch.nn import functional as F
 
 from nanotron import distributed as dist
 from nanotron import logging
+from nanotron.astropt3_metrics import FAMILIES
 from nanotron.config import Config, ParallelismArgs
 from nanotron.config.astropt3_config import AstroPT3Config
 from nanotron.config.models_config import RandomInit, SpectralMupInit
@@ -424,57 +425,56 @@ class AstroPT3Loss(nn.Module):
         **predictions: torch.Tensor,  # {name}_pred + {name}_z / {name}_logdet
     ) -> Dict[str, torch.Tensor]:
         graph_zero = None
-        reference_loss = None
-        losses_by_family = {"image": [], "spectrum": [], "scalar": []}
-        out = {}
+        losses_by_family = {family: [] for family in FAMILIES}
+        sums, counts = [], []
+        family_sums = {family: [] for family in FAMILIES}
+        family_counts: Dict[str, int] = dict.fromkeys(FAMILIES, 0)
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
-            present = pred.shape[0] > 0
-            if not present:
+            count = pred.shape[0]
+            counts.append(count)
+            if not count:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
-            elif name in self.scalar_names:
+                graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
+                sums.append(mod_loss.detach())
+                continue
+            if name in self.scalar_names:
                 # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
                 # no logdet
                 logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
-                mod_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma).mean()
+                token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
             else:
                 # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
                 # negative); z/logdet come clean from the embedding block
                 logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
                 nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
-                mod_loss = (nll - predictions[f"{name}_logdet"].float()).mean()
-            if present:
-                losses_by_family[self.modality_families[name]].append(mod_loss)
-            else:
-                graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
-            out[f"{name}_loss"] = mod_loss
-            reference_loss = mod_loss  # device/dtype for absent families
+                token_loss = nll - predictions[f"{name}_logdet"].float()
+            family = self.modality_families[name]
+            losses_by_family[family].append(token_loss.mean())
+            loss_sum = token_loss.detach().sum()
+            sums.append(loss_sum)
+            family_sums[family].append(loss_sum if family == "scalar" else loss_sum / self.modality_dims[name])
+            family_counts[family] += count
 
         total = graph_zero
         weight_sum = 0.0
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
         for family, losses in losses_by_family.items():
             if not losses:
-                # PipelineBlock asserts an exact output-key set, so a family
-                # absent from THIS batch still has to report a key; it stays
-                # out of the weighted total, and 0.0 reads as "no targets"
-                # against the per-modality losses beside it
-                placeholder = (
-                    torch.zeros_like(reference_loss)
-                    if reference_loss is not None
-                    else torch.zeros(())
-                )
-                out[f"{family}_family_loss"] = placeholder
                 continue
             family_loss = torch.stack(losses).mean()
-            out[f"{family}_family_loss"] = family_loss
             weighted = family_weights[family] * family_loss
             total = weighted if total is None else total + weighted
             weight_sum += family_weights[family]
         if total is None:
             raise ValueError("AstroPT3 loss received no modality predictions")
-        out["loss"] = total / weight_sum if weight_sum else total
-        return out
+        zero = total.new_zeros(())
+        for family, values in family_sums.items():
+            sums.append(torch.stack(values).sum() if values else zero)
+            counts.append(family_counts[family])
+        # Pack counts in fp64 so a large global step does not round away targets.
+        loss_stats = torch.stack((torch.stack(sums), total.new_tensor(counts, dtype=torch.float64)), dim=1)
+        return {"loss": total / weight_sum if weight_sum else total, "loss_stats": loss_stats}
 
 
 class AstroPT3Model(nn.Module):
@@ -732,11 +732,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             module_input_keys={"modality_values"}
             | {f"{name}_pred" for name in config.modality_names()}
             | self.model.jet_keys,
-            module_output_keys={"loss"}
-            | {f"{name}_loss" for name in config.modality_names()}
-            # families are the fixed image/spectrum/scalar set (config validates
-            # it), and the loss emits all three every batch to keep this static
-            | {f"{family}_family_loss" for family in ("image", "spectrum", "scalar")},
+            module_output_keys={"loss", "loss_stats"},
         )
         self.parallel_context = parallel_context
         self.config = config
