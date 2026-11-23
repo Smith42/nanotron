@@ -28,7 +28,9 @@ from torch.utils.data import DataLoader
 
 from nanotron import distributed as dist
 from nanotron import logging
+from nanotron.astropt3_metrics import reduce_loss_metrics
 from nanotron.config import (
+    AstroPT3Config,
     Config,
     DatasetStageArgs,
     ExistingCheckpointInit,
@@ -62,8 +64,8 @@ from nanotron.logging import (
 from nanotron.logging.timers import nanotron_timer
 from nanotron.metrics_logging import MetricsLogger
 from nanotron.models import NanotronModel, build_model
-from nanotron.models.base import check_model_has_grad
 from nanotron.models.astropt3 import AstroPT3ForTraining
+from nanotron.models.base import check_model_has_grad
 from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.qwen import Qwen2ForTraining
 from nanotron.models.starcoder2 import Starcoder2ForTraining
@@ -872,10 +874,10 @@ class DistributedTrainer:
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
-        # astropt3: surface per-modality losses (rank-local like z_loss —
-        # not DP-synced, logging only). The model emits {name}_loss for every
-        # modality on every micro-batch (0.0 when absent from the batch).
-        if outputs and isinstance(outputs[0], dict):
+        if isinstance(self.model_config, AstroPT3Config):
+            metrics = reduce_loss_metrics(outputs, self.model_config.modality_names(), self.parallel_context.dp_pg)
+            basic_log_entries.extend(LogItem(key, value, "human_format") for key, value in metrics.items())
+        elif outputs and isinstance(outputs[0], dict):
             for key in sorted(outputs[0]):
                 if key.endswith("_loss") and key not in ("z_loss",) and isinstance(
                     outputs[0][key], torch.Tensor

@@ -52,6 +52,7 @@ from torch.nn import functional as F
 
 from nanotron import distributed as dist
 from nanotron import logging
+from nanotron.astropt3_metrics import FAMILIES
 from nanotron.config import Config, ParallelismArgs
 from nanotron.config.astropt3_config import AstroPT3Config
 from nanotron.config.models_config import RandomInit, SpectralMupInit
@@ -428,9 +429,11 @@ class AstroPT3Loss(nn.Module):
     Each family's loss is one mean over all of its tokens, so a modality counts
     in proportion to its tokens in the batch; image and spectrum token NLLs are
     first divided by ``input_size`` (nats per dimension). Present families
-    combine at image:spectrum:scalar 1:1:0.1. ``{name}_loss`` stays the raw
-    per-token mean. Absent modalities still contribute ``0 * pred.sum()`` to
-    keep their decoders in the DDP graph.
+    combine at image:spectrum:scalar 1:1:0.1. ``loss_stats`` carries detached
+    (loss sum, target count) rows per modality (raw per-token loss) and per
+    family, which the trainer pools across micro-batches and DP ranks for
+    logging. Absent modalities still contribute ``0 * pred.sum()`` to keep
+    their decoders in the DDP graph.
     """
 
     def __init__(self, config: AstroPT3Config):
@@ -450,71 +453,60 @@ class AstroPT3Loss(nn.Module):
         **predictions: torch.Tensor,  # {name}_pred + {name}_z / {name}_logdet
     ) -> Dict[str, torch.Tensor]:
         graph_zero = None
-        reference_loss = None
-        family_sums, family_counts = {}, {}
-        out = {}
+        sums, counts = [], []
+        family_sums: Dict[str, torch.Tensor] = {}
+        family_counts: Dict[str, int] = dict.fromkeys(FAMILIES, 0)
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
-            present = pred.shape[0] > 0
-            if not present:
+            count = pred.shape[0]
+            counts.append(count)
+            if not count:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
-            else:
-                if name in self.categorical_names:
-                    # one-hot target -> class index; cross-entropy (HF twin mirrors this)
-                    token_loss = F.cross_entropy(
-                        pred.float(), modality_values[name].argmax(dim=-1), reduction="none"
-                    )
-                elif name in self.scalar_names:
-                    # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
-                    # no logdet
-                    logits_pi, mu, log_sigma = unpack_gmm_params(
-                        pred.float(), self.scalar_gmm_k, self.modality_dims[name]
-                    )
-                    token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
-                else:
-                    # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
-                    # negative); z/logdet both come from the same flow pass
-                    logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
-                    nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
-                    token_loss = nll - predictions[f"{name}_logdet"].float()
-                mod_loss = token_loss.mean()
-                family = self.modality_families[name]
-                # patch tokens in nats per dimension; scalar tokens as they are
-                pooled = token_loss.sum()
-                if family != "scalar":
-                    pooled = pooled / self.modality_dims[name]
-                family_sums[family] = pooled if family not in family_sums else family_sums[family] + pooled
-                family_counts[family] = family_counts.get(family, 0) + token_loss.numel()
-            if not present:
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
-            out[f"{name}_loss"] = mod_loss
-            reference_loss = mod_loss  # device/dtype for absent families
+                sums.append(mod_loss.detach())
+                continue
+            if name in self.categorical_names:
+                # one-hot target -> class index; cross-entropy (HF twin mirrors this)
+                token_loss = F.cross_entropy(pred.float(), modality_values[name].argmax(dim=-1), reduction="none")
+            elif name in self.scalar_names:
+                # ADR 0008: GMM NLL on the raw normalized scalar — no flow,
+                # no logdet
+                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.scalar_gmm_k, self.modality_dims[name])
+                token_loss = gmm_nll(modality_values[name].float(), logits_pi, mu, log_sigma)
+            else:
+                # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
+                # negative); z/logdet both come from the same flow pass
+                logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
+                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
+                token_loss = nll - predictions[f"{name}_logdet"].float()
+            sums.append(token_loss.detach().sum())
+            family = self.modality_families[name]
+            # patch tokens in nats per dimension; scalar tokens as they are
+            pooled = token_loss.sum()
+            if family != "scalar":
+                pooled = pooled / self.modality_dims[name]
+            family_sums[family] = pooled if family not in family_sums else family_sums[family] + pooled
+            family_counts[family] += count
 
         total = graph_zero
         weight_sum = 0.0
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
         for family in family_weights:
             if family not in family_sums:
-                # PipelineBlock asserts an exact output-key set, so a family
-                # absent from THIS batch still has to report a key; it stays
-                # out of the weighted total, and 0.0 reads as "no targets"
-                # against the per-modality losses beside it
-                placeholder = (
-                    torch.zeros_like(reference_loss)
-                    if reference_loss is not None
-                    else torch.zeros(())
-                )
-                out[f"{family}_family_loss"] = placeholder
                 continue
             family_loss = family_sums[family] / family_counts[family]
-            out[f"{family}_family_loss"] = family_loss
             weighted = family_weights[family] * family_loss
             total = weighted if total is None else total + weighted
             weight_sum += family_weights[family]
         if total is None:
             raise ValueError("AstroPT3 loss received no modality predictions")
-        out["loss"] = total / weight_sum if weight_sum else total
-        return out
+        zero = total.new_zeros(())
+        for family in FAMILIES:
+            sums.append(family_sums[family].detach() if family in family_sums else zero)
+            counts.append(family_counts[family])
+        # Pack counts in fp64 so a large global step does not round away targets.
+        loss_stats = torch.stack((torch.stack(sums), total.new_tensor(counts, dtype=torch.float64)), dim=1)
+        return {"loss": total / weight_sum if weight_sum else total, "loss_stats": loss_stats}
 
 
 class AstroPT3Model(nn.Module):
@@ -772,11 +764,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             module_input_keys={"modality_values"}
             | {f"{name}_pred" for name in config.modality_names()}
             | self.model.jet_keys,
-            module_output_keys={"loss"}
-            | {f"{name}_loss" for name in config.modality_names()}
-            # families are the fixed image/spectrum/scalar set (config validates
-            # it), and the loss emits all three every batch to keep this static
-            | {f"{family}_family_loss" for family in ("image", "spectrum", "scalar")},
+            module_output_keys={"loss", "loss_stats"},
         )
         self.parallel_context = parallel_context
         self.config = config
