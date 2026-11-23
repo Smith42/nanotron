@@ -310,6 +310,7 @@ def get_dataloader_from_data_stage(
             micro_batch_size=trainer.micro_batch_size,
             sequence_length=trainer.sequence_length,
             dp_rank=dist.get_rank(trainer.parallel_context.dp_pg),
+            dp_size=trainer.parallel_context.dp_pg.size(),
             num_workers=data.num_loading_workers or 0,
             seed=data.seed or 0,
         )
