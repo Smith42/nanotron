@@ -637,15 +637,12 @@ class DistributedTrainer:
                 self.metadata.last_train_step = self.iteration_step
                 self.metadata.current_stage.consumed_train_samples += self.global_batch_size
 
-                # astropt3: the streaming dataset exposes no per-folder
-                # consumption stats, so keep the stage's token ledger in sync
-                # by hand or TrainingMetadata's consumed_tokens_total
-                # invariant fails when the checkpoint is loaded on resume
-                _ds = getattr(getattr(self, "current_base_dl", None), "dataset", None)
-                if _ds is not None and hasattr(_ds, "_ckpt_state"):
+                # astropt3: the catalog stream exposes no per-folder consumption
+                # stats, so keep one ledger entry or TrainingMetadata's
+                # consumed_tokens_total invariant fails when a checkpoint is loaded
+                if getattr(self.config.data_stages[self.metadata.last_stage_idx].data.dataset, "is_astropt3_streaming", False):
                     self.metadata.current_stage.consumed_tokens_per_dataset_folder = {
-                        getattr(_ds, "data_root", "stream"): self.metadata.current_stage.consumed_train_samples
-                        * self.sequence_length
+                        "catalog-stream": self.metadata.current_stage.consumed_train_samples * self.sequence_length
                     }
                 assert self.metadata.current_stage.sequence_length == self.sequence_length, "Sequence length mismatch between the current stage and the global sequence length"
 

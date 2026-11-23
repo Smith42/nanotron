@@ -98,5 +98,5 @@ class AstroPT3StreamingDatasetsArgs:
     def __post_init__(self):
         if type(self.echo_factor) is not int or self.echo_factor < 1:
             raise ValueError("echo_factor must be a positive integer")
-        if not isinstance(self.catalog_stream, dict) or not self.catalog_stream.get("catalogs"):
+        if not isinstance(self.catalog_stream, dict) or "catalogs" not in self.catalog_stream:
             raise ValueError("catalog_stream.catalogs is required; migrate legacy dataset YAML")
