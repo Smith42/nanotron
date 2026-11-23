@@ -376,6 +376,16 @@ class TokensArgs:
     val_check_interval: Optional[int] = -1
     limit_val_batches: Optional[int] = 0
     limit_test_batches: Optional[int] = 0
+    validation_objects: int = 0  # AstroPT3 fixed panel size, global across replicas
+    validation_manifest: Optional[str] = None  # require these exact IDs when streaming the panel
+
+    def __post_init__(self):
+        if type(self.validation_objects) is not int or self.validation_objects < 0:
+            raise ValueError("validation_objects must be a nonnegative integer")
+        if self.validation_manifest is not None and not self.validation_objects:
+            raise ValueError("validation_manifest requires validation_objects > 0")
+        if self.validation_objects and (type(self.val_check_interval) is not int or self.val_check_interval <= 0):
+            raise ValueError("validation_objects requires a positive val_check_interval")
 
 
 @dataclass

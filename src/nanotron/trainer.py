@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.astropt3_metrics import reduce_loss_metrics
+from nanotron.astropt3_validation import evaluate_validation_shard, load_validation_shard
 from nanotron.config import (
     AstroPT3Config,
     AstroPT3StreamingDatasetsArgs,
@@ -558,11 +559,17 @@ class DistributedTrainer:
         ],
         *,
         max_steps: Optional[int] = None,
+        enable_validation: Optional[bool] = None,
         **kwargs,
     ) -> None:
-        """Train at most ``max_steps`` additional optimizer steps, without changing the YAML horizon."""
+        """Train at most ``max_steps`` additional optimizer steps, without changing the YAML horizon.
+
+        Benchmark callers skip validation unless explicitly opting in.
+        """
+        tokens = self.config.tokens
+        assert tokens is not None
         self.initial_iter_step = self.metadata.last_train_step + 1
-        self.last_iter_step = self.config.tokens.train_steps
+        self.last_iter_step = tokens.train_steps
         if max_steps is not None:
             if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
                 raise ValueError("max_steps must be a positive integer")
@@ -586,6 +593,29 @@ class DistributedTrainer:
         }
         # Fix the root_model
         self.unwrapped_model.module_id_to_prefix[id(self.unwrapped_model)] = ""
+
+        validation_batches = None
+        val_interval = tokens.val_check_interval
+        if enable_validation is None:
+            enable_validation = not self.benchmark
+        if enable_validation and tokens.validation_objects:
+            if not isinstance(self.model_config, AstroPT3Config) or any(
+                group.size() != 1
+                for group in (self.parallel_context.pp_pg, self.parallel_context.cp_pg, self.parallel_context.ep_pg)
+            ):
+                raise ValueError("Fixed validation panels require AstroPT3 with PP=CP=EP=1")
+            assert val_interval is not None and val_interval > 0
+            if self.last_iter_step // val_interval > (self.initial_iter_step - 1) // val_interval:
+                started = time.perf_counter()
+                validation_batches = load_validation_shard(
+                    self.config, self.model_config, self.parallel_context, self.init_checkpoint_path
+                )
+                log_rank(
+                    f"Loaded {tokens.validation_objects} validation objects in {time.perf_counter() - started:.2f}s",
+                    logger=logger,
+                    level=logging.INFO,
+                    rank=0,
+                )
 
         self.pre_training(**kwargs)
 
@@ -670,8 +700,32 @@ class DistributedTrainer:
                 )
 
                 self.iteration_timer.end()
+                self.validation_metrics = {}
+                if validation_batches is not None and val_interval and self.iteration_step % val_interval == 0:
+                    assert isinstance(self.model_config, AstroPT3Config)
+                    device = torch.device("cuda", torch.cuda.current_device())
+                    torch.cuda.synchronize(device)
+                    self.validation_metrics = evaluate_validation_shard(
+                        self.unwrapped_model,
+                        validation_batches,
+                        self.model_config.modality_names(),
+                        device,
+                        self.parallel_context.dp_pg,
+                    )
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg, z_loss_avg=z_loss_avg, tbi_logs=tbi_logs)
+                elif self.validation_metrics and dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0]:
+                    assert self.loggerwriter is not None
+                    self.loggerwriter.add_scalars_from_list(
+                        [LogItem(key, value, "human_format") for key, value in self.validation_metrics.items()],
+                        self.iteration_step,
+                    )
+                    if not self.benchmark and wandb is not None:
+                        wandb.log(
+                            {**self.validation_metrics, "iteration_step": self.iteration_step},
+                            step=self.iteration_step,
+                            commit=True,
+                        )
 
                 # Checkpoint
                 saved_at_last_step = self._should_checkpoint()
@@ -966,6 +1020,11 @@ class DistributedTrainer:
                     continue
 
             return cpu_memory_log_entries + swap_memory_log_entries + process_memory_log_entries
+
+        if world_rank == self.logger_ranks[0]:
+            basic_log_entries.extend(
+                LogItem(key, value, "human_format") for key, value in self.validation_metrics.items()
+            )
 
         if z_loss_avg is not None:
             basic_log_entries.insert(6, LogItem("z_loss", z_loss_avg.item(), "human_format"))  # , "1.6E"),
