@@ -7,17 +7,20 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
 torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llama.yaml
 ```
 """
+
 import argparse
 import time
+from functools import partial
 from pprint import pformat
-from typing import Dict, Optional, cast
+from typing import Dict, Optional
+
+from torch.utils.data import DataLoader
 
 import nanotron.distributed as dist
 from nanotron import logging
 from nanotron.config import (
     AstroPT3StreamingDatasetsArgs,
     DataArgs,
-    DatasetStageArgs,
     NanosetDatasetsArgs,
     PretrainDatasetsArgs,
     Qwen2Config,
@@ -34,16 +37,13 @@ from nanotron.data.processing import (
 from nanotron.data.sft_processing import prepare_sft_dataset
 from nanotron.helpers import (
     compute_remain_train_steps_of_a_data_stage_from_ckp,
-    get_consumed_train_samples_of_a_data_stage_from_ckp,
 )
 from nanotron.logging import log_rank
 from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.sanity_checks import sanity_check_dataloader
-from nanotron.trainer import DistributedTrainer
+from nanotron.trainer import DataStageMetadata, DistributedTrainer
 from nanotron.utils import main_rank_first
-from torch.utils.data import DataLoader
-from nanotron.trainer import DataStageMetadata
-from collections import defaultdict
+
 try:
     from huggingface_hub import __version__ as hf_hub_version
     from transformers import AutoTokenizer
@@ -126,14 +126,14 @@ def get_dataloader_from_data_stage(
             tokenizer.padding_side = "left"
             sequence_sep_tokens = [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
             # assert bos or eos are present
-            assert (
-                tokenizer.bos_token is not None or tokenizer.eos_token is not None
-            ), f"Tokenizer must have either bos or eos token, but found none for {tokenizer_path}"
+            assert tokenizer.bos_token is not None or tokenizer.eos_token is not None, (
+                f"Tokenizer must have either bos or eos token, but found none for {tokenizer_path}"
+            )
 
             # Check that tokenizer's vocab size is smaller than the model's vocab size
-            assert (
-                tokenizer.vocab_size <= trainer.model_config.vocab_size
-            ), f"Tokenizer's vocab size ({tokenizer.vocab_size}) is larger than the model's vocab size ({trainer.model_config.vocab_size})"
+            assert tokenizer.vocab_size <= trainer.model_config.vocab_size, (
+                f"Tokenizer's vocab size ({tokenizer.vocab_size}) is larger than the model's vocab size ({trainer.model_config.vocab_size})"
+            )
 
             # Different processing for SFT vs pretraining
             if isinstance(data.dataset, SFTDatasetsArgs):
@@ -193,9 +193,9 @@ def get_dataloader_from_data_stage(
 
         tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        assert (
-            len(tokenizer) == trainer.model_config.vocab_size
-        ), f"Tokenizer vocab size ({len(tokenizer)}) does not match model config vocab size ({trainer.model_config.vocab_size}). "
+        assert len(tokenizer) == trainer.model_config.vocab_size, (
+            f"Tokenizer vocab size ({len(tokenizer)}) does not match model config vocab size ({trainer.model_config.vocab_size}). "
+        )
         log_rank(
             f"[TokenizedBytes] Creating TokenizedBytes with {len(data.dataset.dataset_folder)} dataset folders and {trainer.config.tokens.train_steps * trainer.global_batch_size} train samples",
             logger=logger,
@@ -229,7 +229,8 @@ def get_dataloader_from_data_stage(
             num_workers=data.num_loading_workers,
             cfg=data.dataset,
             consumed_samples=consumed_train_samples_stage,
-            num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size, # TODO: this overshoots what's needed by the current stage, but it doesnt matter?
+            num_samples=trainer.config.tokens.train_steps
+            * trainer.global_batch_size,  # TODO: this overshoots what's needed by the current stage, but it doesnt matter?
             parallel_context=trainer.parallel_context,
             input_pp_rank=input_pp_rank,
             output_pp_rank=output_pp_rank,
@@ -302,7 +303,8 @@ def get_dataloader_from_data_stage(
         log_rank("Using astropt3_streaming dataloader", logger=logger, level=logging.INFO, rank=0)
         from astropt3.data.nanotron_loader import build_astropt3_dataloader
 
-        dataloader = build_astropt3_dataloader(
+        build_loader = partial(
+            build_astropt3_dataloader,
             dataset_args=data.dataset,
             model_config=trainer.model_config,
             micro_batch_size=trainer.micro_batch_size,
@@ -311,6 +313,14 @@ def get_dataloader_from_data_stage(
             num_workers=data.num_loading_workers or 0,
             seed=data.seed or 0,
         )
+        context = trainer.parallel_context
+        if context.tp_pg.size() > 1:
+            if sanity_check_dataloader_interval is not None:
+                raise ValueError("--sanity-check-dataloader-interval is not supported for AstroPT3 with TP > 1")
+            from astropt3.data.nanotron_loader import share_tp_batches
+
+            return partial(share_tp_batches, build_loader, context.tp_pg, context.world_pg)
+        dataloader = build_loader()
 
     else:
         raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}")
@@ -345,19 +355,23 @@ def get_dataloader(
     # WARNING: we assume we train on last stage
     stage_idx = len(data_stages) - 1
     stage_args = data_stages[stage_idx]
-    if trainer.iteration_step+1 == stage_args.start_training_step:
+    if trainer.iteration_step + 1 == stage_args.start_training_step:
         log_rank(f"Starting new stage {stage_args.name}", logger=logger, level=logging.INFO, rank=0)
         # we start a new stage
         if stage_idx >= len(metadata_stages):
-            metadata_stages.append(DataStageMetadata(
-                name=stage_args.name,
-                start_training_step=stage_args.start_training_step,
-                consumed_train_samples=0,
-                consumed_tokens_per_dataset_folder={},
-                sequence_length=trainer.sequence_length,
-            ))
+            metadata_stages.append(
+                DataStageMetadata(
+                    name=stage_args.name,
+                    start_training_step=stage_args.start_training_step,
+                    consumed_train_samples=0,
+                    consumed_tokens_per_dataset_folder={},
+                    sequence_length=trainer.sequence_length,
+                )
+            )
     elif len(metadata_stages) < len(data_stages):
-        raise ValueError(f"If you're trying to start a new stage, you need to set `start_training_step` to the step after the last stage's: {trainer.iteration_step+1}")
+        raise ValueError(
+            f"If you're trying to start a new stage, you need to set `start_training_step` to the step after the last stage's: {trainer.iteration_step + 1}"
+        )
     current_stage = metadata_stages[stage_idx]
     cur_stage_consumed_train_samples = current_stage.consumed_train_samples
     consumed_tokens_per_dataset_folder = current_stage.consumed_tokens_per_dataset_folder
@@ -365,7 +379,7 @@ def get_dataloader(
 
     num_remaining_train_steps = compute_remain_train_steps_of_a_data_stage_from_ckp(
         stage_args, trainer.config, trainer.metadata
-    ) # TODO: check this
+    )  # TODO: check this
     log_rank(
         f"Current stage: {current_stage.name} has {num_remaining_train_steps} remaining training steps and has consumed {cur_stage_consumed_train_samples} samples"
         f"Consumed tokens per dataset folder: {pformat(consumed_tokens_per_dataset_folder)}",
@@ -382,8 +396,7 @@ def get_dataloader(
     for stage in metadata_stages[:-1]:
         for folder_path, consumed_tokens in stage.consumed_tokens_per_dataset_folder.items():
             last_stages_consumed_tokens_per_dataset_folder[folder_path] = (
-                last_stages_consumed_tokens_per_dataset_folder.get(folder_path, 0)
-                + consumed_tokens
+                last_stages_consumed_tokens_per_dataset_folder.get(folder_path, 0) + consumed_tokens
             )
 
     dataloaders[current_stage.name] = get_dataloader_from_data_stage(
