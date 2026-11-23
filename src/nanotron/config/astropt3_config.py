@@ -94,9 +94,14 @@ class AstroPT3StreamingDatasetsArgs:
     # Total optimizer-step exposures per batch from each loaded draw.
     echo_factor: int = 1
     catalog_stream: Optional[dict] = None
+    paired_echo_factor: Optional[int] = None
 
     def __post_init__(self):
         if type(self.echo_factor) is not int or self.echo_factor < 1:
             raise ValueError("echo_factor must be a positive integer")
+        if self.paired_echo_factor is not None and (
+            type(self.paired_echo_factor) is not int or self.paired_echo_factor < 1
+        ):
+            raise ValueError("paired_echo_factor must be a positive integer")
         if not isinstance(self.catalog_stream, dict) or "catalogs" not in self.catalog_stream:
             raise ValueError("catalog_stream.catalogs is required; migrate legacy dataset YAML")
