@@ -28,9 +28,9 @@ Parallelism contract (see astro/EXPERIMENTS.md Part I):
   to be ALL_REDUCE: REDUCE_SCATTER shards the hidden stream over the sequence
   which breaks the replication argument (revisit if throughput demands).
 - Sequence packing: ``position_ids`` restart at 0 per object and pads sit at
-  position 0, so the ``cu_seqlens`` derived from zeros gives each object (and
-  each pad token) its own attention segment — same doc mask the HF side gets
-  from transformers' ``create_causal_mask``.
+  position 0; ``cu_seqlens`` gives each object its own attention segment and
+  collapses contiguous pad runs per row so large micro-batches stay under
+  FlashAttention2's 65,535-segment CUDA grid limit.
 
 Batch contract (built by ``astropt3.data.nanotron_loader``): flat dict of
 ``input_ids`` [b,s], ``position_ids`` [b,s], and per modality ``{m}_values``
@@ -509,6 +509,25 @@ class AstroPT3Loss(nn.Module):
         return {"loss": total / weight_sum if weight_sum else total, "loss_stats": loss_stats}
 
 
+def _packed_cu_seqlens(
+    input_ids: torch.Tensor, position_ids: torch.Tensor, pad_token_id: Optional[int]
+) -> torch.Tensor:
+    """Segment boundaries for packed objects, collapsing contiguous pad runs per row."""
+    flat_pos = position_ids.view(-1)
+    starts = flat_pos == 0
+    if pad_token_id is not None:
+        is_pad = input_ids.view(-1) == pad_token_id
+        prev_pad = torch.zeros_like(is_pad)
+        prev_pad[1:] = is_pad[:-1]
+        if position_ids.ndim == 2 and position_ids.shape[1] > 0:
+            prev_pad[:: position_ids.shape[1]] = False  # cap pad segments at seq_len (FA2 max_seqlen)
+        starts = starts & ~(is_pad & prev_pad)
+    start_indices = torch.where(starts)[0].to(torch.int32)
+    return torch.cat(
+        [start_indices, torch.tensor([flat_pos.numel()], dtype=torch.int32, device=start_indices.device)]
+    )
+
+
 class AstroPT3Model(nn.Module):
     """Pipeline graph: embedding assembly -> Qwen2 decoder stack -> norm -> heads."""
 
@@ -597,16 +616,13 @@ class AstroPT3Model(nn.Module):
             modality_masks=modality_masks,
         )
 
-        # Position restarts (including position-0 pads, each its own segment)
-        # define the packed-document boundaries, exactly as upstream qwen.
+        # Position restarts define packed-object boundaries; contiguous pad runs
+        # collapse to one segment per row to avoid exceeding FA2's 65,535 grid limit.
         cu_seqlens = None
         if isinstance(position_ids, TensorPointer):
             raise ValueError("AstroPT3 requires PP=1 tensor inputs")
         if position_ids.numel() > 0:
-            start_indices = torch.where(position_ids.view(-1) == 0)[0]
-            cu_seqlens = torch.cat(
-                [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
+            cu_seqlens = _packed_cu_seqlens(input_ids, position_ids, self.config.pad_token_id)
 
         decoder_states = {
             "hidden_states": output["input_embeds"],
