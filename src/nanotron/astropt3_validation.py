@@ -69,7 +69,7 @@ def evaluate_validation_shard(model, batches, modality_names, device, dp_pg):
         if not outputs:
             empty = torch.zeros((len(names) + len(FAMILIES), 2), dtype=torch.float64, device=device)
             outputs = [{"loss_stats": empty}]
-        metrics = reduce_loss_metrics(outputs, names, dp_pg)
+        metrics = reduce_loss_metrics(outputs, names, dp_pg, loss_prefix="val/", count_prefix="loss_count/val/")
     finally:
         model.train(was_training)
-    return {**{f"val/{key}": value for key, value in metrics.items()}, "val/seconds": time.perf_counter() - started}
+    return {**metrics, "val/seconds": time.perf_counter() - started}
