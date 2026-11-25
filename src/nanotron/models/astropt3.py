@@ -161,18 +161,26 @@ def unpack_gmm_params(pred: torch.Tensor, k: int, d: int):
     return logits_pi, mu, log_sigma
 
 
-def gmm_nll(y, logits_pi, mu, log_sigma):
+def gmm_nll(y, logits_pi, mu, log_sigma, valid_mask=None):
     """Per-token negative log-likelihood of y under the predicted GMM.
 
     y: (..., D); logits_pi: (..., K); mu/log_sigma: (..., K, D) -> (...,).
+    With boolean ``valid_mask`` matching ``y``, invalid dimensions are
+    marginalized out analytically; all-invalid tokens return zero loss.
     """
     diff = y.unsqueeze(-2) - mu
-    logp = (
-        -0.5 * (diff.pow(2) * torch.exp(-2 * log_sigma)).sum(dim=-1)
-        - log_sigma.sum(dim=-1)
-        - 0.5 * mu.size(-1) * math.log(2 * math.pi)
+    per_dim = (
+        -0.5 * (diff.pow(2) * torch.exp(-2 * log_sigma))
+        - log_sigma
+        - 0.5 * math.log(2 * math.pi)
     )
-    return -torch.logsumexp(F.log_softmax(logits_pi, dim=-1) + logp, dim=-1)
+    if valid_mask is not None:
+        per_dim = per_dim * valid_mask.unsqueeze(-2).to(per_dim.dtype)
+    logp = per_dim.sum(dim=-1)
+    nll = -torch.logsumexp(F.log_softmax(logits_pi, dim=-1) + logp, dim=-1)
+    if valid_mask is not None:
+        nll = torch.where(valid_mask.any(dim=-1), nll, torch.zeros_like(nll))
+    return nll
 
 
 def left_shift_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -269,12 +277,15 @@ class AstroPT3Embedding(nn.Module):
         modality_values: Dict[str, torch.Tensor],  # name -> [n_m, input_size]
         modality_positions: Dict[str, torch.Tensor],  # name -> [n_m] or [n_m, pos_dim]
         modality_masks: Dict[str, torch.Tensor],  # name -> bool [batch_size, seq_length]
+        modality_valid_masks: Optional[Dict[str, torch.Tensor]] = None,  # name -> bool [n_m, input_size]
     ):
         from astropt3.flows import flow_object_ids, pre_flow_noise_scale
 
+        modality_valid_masks = modality_valid_masks or {}
         input_embeds = self.token_embedding(input_ids.view(-1))  # [b*s, hidden]
         delta = torch.zeros_like(input_embeds)
         extras = {}
+        latent_valid_masks: Dict[str, torch.Tensor] = {}
         pre_flow_scale = pre_flow_noise_scale(self.jet_noise_frac) if self.training else 0.0
         latent_sigma = 0.0
         if self.training:
@@ -287,21 +298,32 @@ class AstroPT3Embedding(nn.Module):
         for name, encoder in self.encoders.items():
             values = modality_values[name]
             if name not in self.scalar_names:
+                valid_mask = modality_valid_masks.get(name)
                 values = self._add_noise(values, self.pre_flow_noise_max[name] * pre_flow_scale)
                 z, logdet = self.flows[name](
                     values.to(input_embeds.dtype),
                     modality_positions[name],
                     flow_object_ids(position_ids, modality_masks[name]),
+                    valid_mask=valid_mask,
                 )
                 extras[f"{name}_z"] = z
                 extras[f"{name}_logdet"] = logdet
                 values = self._add_noise(z, latent_sigma)
+                if valid_mask is not None:
+                    valid_z = self.flows[name].permute_mask(valid_mask)
+                    latent_valid_masks[name] = valid_z
+                    values = torch.where(valid_z, values, torch.zeros_like(values))
             # The affine flow may return fp32; only the embedded copy is cast, never the loss target.
             content = encoder(values.to(input_embeds.dtype)) + self.pos_embeds[name](modality_positions[name]).to(
                 input_embeds.dtype
             )
             delta = delta.index_put((modality_masks[name].view(-1),), content.to(input_embeds.dtype))
-        return {"input_embeds": input_embeds + delta, "position_ids": position_ids, **extras}
+        return {
+            "input_embeds": input_embeds + delta,
+            "position_ids": position_ids,
+            "modality_latent_valid_masks": latent_valid_masks,
+            **extras,
+        }
 
 
 class AstroPT3ModalityHead(nn.Module):
@@ -450,21 +472,26 @@ class AstroPT3Loss(nn.Module):
     def forward(
         self,
         modality_values: Dict[str, torch.Tensor],  # name -> [n_m, input_size] (scalar targets)
+        modality_latent_valid_masks: Optional[Dict[str, torch.Tensor]] = None,
         **predictions: torch.Tensor,  # {name}_pred + {name}_z / {name}_logdet
     ) -> Dict[str, torch.Tensor]:
+        latent_valid_masks = modality_latent_valid_masks or {}
         graph_zero = None
         sums, counts = [], []
         family_sums: Dict[str, torch.Tensor] = {}
-        family_counts: Dict[str, int] = dict.fromkeys(FAMILIES, 0)
+        family_counts: Dict[str, torch.Tensor] = {}
+        ref = next(iter(predictions.values()))
+        zero_f64 = ref.new_zeros((), dtype=torch.float64)
         for name in self.modality_dims:
             pred = predictions[f"{name}_pred"]
             count = pred.shape[0]
-            counts.append(count)
             if not count:
                 mod_loss = pred.sum().float()  # 0.0, but keeps the decoder in the graph
                 graph_zero = mod_loss if graph_zero is None else graph_zero + mod_loss
                 sums.append(mod_loss.detach())
+                counts.append(zero_f64)
                 continue
+            valid_z = None
             if name in self.categorical_names:
                 # one-hot target -> class index; cross-entropy (HF twin mirrors this)
                 token_loss = F.cross_entropy(pred.float(), modality_values[name].argmax(dim=-1), reduction="none")
@@ -477,36 +504,51 @@ class AstroPT3Loss(nn.Module):
                 # exact patch-space likelihood: NLL_GMM(z) - logdet (can go
                 # negative); z/logdet both come from the same flow pass
                 logits_pi, mu, log_sigma = unpack_gmm_params(pred.float(), self.gmm_k, self.modality_dims[name])
-                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma)
+                valid_z = latent_valid_masks.get(name)
+                nll = gmm_nll(predictions[f"{name}_z"].float(), logits_pi, mu, log_sigma, valid_mask=valid_z)
                 token_loss = nll - predictions[f"{name}_logdet"].float()
+            eff_count = (
+                valid_z.sum(dtype=torch.float64) / self.modality_dims[name]
+                if valid_z is not None
+                else ref.new_tensor(count, dtype=torch.float64)
+            )
             sums.append(token_loss.detach().sum())
+            counts.append(eff_count.detach())
             family = self.modality_families[name]
             # patch tokens in nats per dimension; scalar tokens as they are
             pooled = token_loss.sum()
             if family != "scalar":
                 pooled = pooled / self.modality_dims[name]
             family_sums[family] = pooled if family not in family_sums else family_sums[family] + pooled
-            family_counts[family] += count
+            family_counts[family] = eff_count if family not in family_counts else family_counts[family] + eff_count
 
         total = graph_zero
-        weight_sum = 0.0
+        weight_sum = ref.new_zeros((), dtype=torch.float32)
+        zero_f32 = ref.new_zeros((), dtype=torch.float32)
         family_weights = {"image": 1.0, "spectrum": 1.0, "scalar": 0.1}
         for family in family_weights:
             if family not in family_sums:
                 continue
-            family_loss = family_sums[family] / family_counts[family]
-            weighted = family_weights[family] * family_loss
+            fc = family_counts[family]
+            has_family = fc > 0
+            safe_denom = torch.where(has_family, fc, torch.ones_like(fc)).to(family_sums[family].dtype)
+            # Keep family_sums[family] in the autograd graph even when fc == 0 (all-masked spectrum)
+            # so DDP never sees unused parameters on the decoder/flow.
+            family_loss = family_sums[family] / safe_denom
+            w = torch.where(has_family, ref.new_tensor(family_weights[family], dtype=torch.float32), zero_f32)
+            weighted = w * family_loss
             total = weighted if total is None else total + weighted
-            weight_sum += family_weights[family]
+            weight_sum = weight_sum + w
         if total is None:
             raise ValueError("AstroPT3 loss received no modality predictions")
         zero = total.new_zeros(())
         for family in FAMILIES:
             sums.append(family_sums[family].detach() if family in family_sums else zero)
-            counts.append(family_counts[family])
+            counts.append(family_counts[family].detach() if family in family_counts else zero_f64)
         # Pack counts in fp64 so a large global step does not round away targets.
-        loss_stats = torch.stack((torch.stack(sums), total.new_tensor(counts, dtype=torch.float64)), dim=1)
-        return {"loss": total / weight_sum if weight_sum else total, "loss_stats": loss_stats}
+        loss_stats = torch.stack((torch.stack(sums).to(torch.float64), torch.stack(counts)), dim=1)
+        safe_weight = torch.where(weight_sum > 0, weight_sum, torch.ones_like(weight_sum))
+        return {"loss": torch.where(weight_sum > 0, total / safe_weight, total), "loss_stats": loss_stats}
 
 
 class AstroPT3Model(nn.Module):
@@ -542,8 +584,15 @@ class AstroPT3Model(nn.Module):
                 "tp_pg": parallel_context.tp_pg,
                 "random_states": random_states,
             },
-            module_input_keys={"input_ids", "position_ids", "modality_values", "modality_positions", "modality_masks"},
-            module_output_keys={"input_embeds", "position_ids"} | self.jet_keys,
+            module_input_keys={
+                "input_ids",
+                "position_ids",
+                "modality_values",
+                "modality_positions",
+                "modality_masks",
+                "modality_valid_masks",
+            },
+            module_output_keys={"input_embeds", "position_ids", "modality_latent_valid_masks"} | self.jet_keys,
         )
 
         self.decoder = nn.ModuleList(
@@ -588,6 +637,7 @@ class AstroPT3Model(nn.Module):
         modality_values: Dict[str, torch.Tensor],
         modality_positions: Dict[str, torch.Tensor],
         modality_masks: Dict[str, torch.Tensor],
+        modality_valid_masks: Optional[Dict[str, torch.Tensor]] = None,
     ):
         output = self.token_position_embeddings(
             input_ids=input_ids,
@@ -595,6 +645,7 @@ class AstroPT3Model(nn.Module):
             modality_values=modality_values,
             modality_positions=modality_positions,
             modality_masks=modality_masks,
+            modality_valid_masks=modality_valid_masks or {},
         )
 
         # Position restarts (including position-0 pads, each its own segment)
@@ -619,8 +670,12 @@ class AstroPT3Model(nn.Module):
         hidden_states = self.final_layer_norm(input=decoder_states["hidden_states"])["hidden_states"]
 
         predictions = self.modality_head(hidden_states=hidden_states, modality_masks=modality_masks)
-        # jetformer: forward the embedding block's clean z/logdet to the loss
-        return {**predictions, **{k: output[k] for k in self.jet_keys}}
+        # jetformer: forward the embedding block's clean z/logdet and latent valid masks to the loss
+        return {
+            **predictions,
+            "modality_latent_valid_masks": output["modality_latent_valid_masks"],
+            **{k: output[k] for k in self.jet_keys},
+        }
 
     def get_block_compute_costs(self):
         """Compute costs per block for PP load balancing (PP=1: cosmetic)."""
@@ -761,7 +816,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             p2p=self.model.p2p,
             module_builder=AstroPT3Loss,
             module_kwargs={"config": config},
-            module_input_keys={"modality_values"}
+            module_input_keys={"modality_values", "modality_latent_valid_masks"}
             | {f"{name}_pred" for name in config.modality_names()}
             | self.model.jet_keys,
             module_output_keys={"loss", "loss_stats"},
@@ -774,12 +829,17 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
-        **modality_tensors: Union[torch.Tensor, TensorPointer],  # {m}_values / {m}_positions / {m}_mask
+        **modality_tensors: Union[torch.Tensor, TensorPointer],  # {m}_values / {m}_positions / {m}_mask [/ {m}_valid]
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         names = cast(AstroPT3Config, self.config).modality_names()
         modality_values = {name: modality_tensors[f"{name}_values"] for name in names}
         modality_positions = {name: modality_tensors[f"{name}_positions"] for name in names}
         modality_masks = {name: modality_tensors[f"{name}_mask"] for name in names}
+        modality_valid_masks = {
+            name: modality_tensors[f"{name}_valid"]
+            for name in names
+            if f"{name}_valid" in modality_tensors
+        }
 
         predictions = self.model(
             input_ids=input_ids,
@@ -787,6 +847,7 @@ class AstroPT3ForTraining(NanotronModel, LoggingCollectorMixin):
             modality_values=modality_values,
             modality_positions=modality_positions,
             modality_masks=modality_masks,
+            modality_valid_masks=modality_valid_masks,
         )
         return self.loss(modality_values=modality_values, **predictions)
 

@@ -15,7 +15,7 @@ def reduce_loss_metrics(outputs, modality_names, dp_pg=None):
     names = [*modality_names, *(f"{family}_family" for family in FAMILIES)]
     metrics = {}
     for name, (loss_sum, count) in zip(names, totals.tolist(), strict=True):
-        metrics[f"{name}_loss_count"] = int(count)
+        metrics[f"{name}_loss_count"] = int(round(count)) if count == 0 or count >= 0.5 else 1
         if count:
             metrics[f"{name}_loss"] = loss_sum / count
     return metrics
